@@ -1,0 +1,53 @@
+# Rust
+/target/
+**/target/
+*.rs.bk
+Cargo.lock
+
+# Build
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Config (keep templates, ignore actual configs)
+config/*.json
+!config/*.example.json
+
+# Keys (never commit keys!)
+*.pem
+*.key
+*.secret
+secrets/
+
+# Docker
+*.dockerfile
+
+# Test
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Documentation build
+docs/_build/
+
+# Internal documentation (not for public distribution)
+docs/

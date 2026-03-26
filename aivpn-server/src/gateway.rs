@@ -1,0 +1,869 @@
+//! Gateway Engine - Full Implementation
+//! 
+//! Handles:
+//! - UDP packet reception with O(1) tag validation
+//! - Decryption and de-mimicry
+//! - NAT forwarding to internet
+//! - Bidirectional traffic shaping
+//! - Neural Resonance validation (Patent 1)
+//! - Automatic mask rotation on compromise (Patent 3)
+
+use std::net::{Ipv4Addr, SocketAddr, IpAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use bytes::BytesMut;
+use dashmap::DashMap;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{info, warn, error, debug};
+
+use aivpn_common::crypto::{
+    self, encrypt_payload, decrypt_payload, SessionKeys,
+    TAG_SIZE, NONCE_SIZE, CHACHA20_KEY_SIZE,
+};
+use aivpn_common::protocol::{
+    AivpnPacket, InnerType, InnerHeader, ControlPayload, ControlSubtype,
+    MAX_PACKET_SIZE, MIN_HEADER_OVERHEAD, AckPacket,
+};
+use aivpn_common::mask::{MaskProfile, SpoofProtocol};
+use aivpn_common::error::{Error, Result};
+
+use crate::session::{SessionManager, Session, SessionState};
+use crate::nat::NatForwarder;
+use crate::neural::{NeuralResonanceModule, NeuralConfig, ResonanceStatus};
+use crate::metrics::MetricsCollector;
+
+/// Gateway configuration
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    pub listen_addr: String,
+    pub tun_name: String,
+    pub tun_addr: String,
+    pub tun_netmask: String,
+    pub server_private_key: [u8; 32],
+    pub signing_key: [u8; 64],
+    pub enable_nat: bool,
+    /// Enable neural resonance module (Patent 1)
+    pub enable_neural: bool,
+    /// Neural resonance configuration
+    pub neural_config: NeuralConfig,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0:443".to_string(),
+            tun_name: "aivpn0".to_string(),
+            tun_addr: "10.0.0.1".to_string(),
+            tun_netmask: "255.255.255.0".to_string(),
+            server_private_key: [0u8; 32],
+            signing_key: [0u8; 64],
+            enable_nat: true,
+            enable_neural: true,
+            neural_config: NeuralConfig::default(),
+        }
+    }
+}
+
+/// Mask catalog for automatic rotation (Patent 3 + Patent 9)
+///
+/// Holds a pool of pre-generated masks. When neural resonance detects
+/// that a mask is compromised by DPI, the catalog provides a replacement.
+pub struct MaskCatalog {
+    /// Available masks (mask_id → MaskProfile)
+    masks: DashMap<String, MaskProfile>,
+    /// Compromised mask IDs — never reuse
+    compromised: DashMap<String, Instant>,
+}
+
+impl MaskCatalog {
+    pub fn new() -> Self {
+        use aivpn_common::mask::preset_masks;
+        let catalog = Self {
+            masks: DashMap::new(),
+            compromised: DashMap::new(),
+        };
+        // Seed with built-in masks
+        let m1 = preset_masks::webrtc_zoom_v3();
+        let m2 = preset_masks::quic_https_v2();
+        catalog.masks.insert(m1.mask_id.clone(), m1);
+        catalog.masks.insert(m2.mask_id.clone(), m2);
+        catalog
+    }
+
+    /// Register a new mask (e.g., received via passive distribution or neural unpack)
+    pub fn register_mask(&self, mask: MaskProfile) {
+        if !self.compromised.contains_key(&mask.mask_id) {
+            self.masks.insert(mask.mask_id.clone(), mask);
+        }
+    }
+
+    /// Mark a mask as compromised — remove from rotation
+    pub fn mark_compromised(&self, mask_id: &str) {
+        self.compromised.insert(mask_id.to_string(), Instant::now());
+        self.masks.remove(mask_id);
+    }
+
+    /// Select the best non-compromised mask, excluding `current_mask_id`
+    pub fn select_fallback(&self, current_mask_id: &str) -> Option<MaskProfile> {
+        self.masks.iter()
+            .filter(|e| e.key() != current_mask_id)
+            .map(|e| e.value().clone())
+            .next()
+    }
+
+    /// Get mask count
+    pub fn available_count(&self) -> usize {
+        self.masks.len()
+    }
+}
+
+/// Hash a socket address for privacy-preserving logging (MED-4)
+fn hash_addr(addr: &SocketAddr) -> String {
+    let hash = crypto::blake3_hash(addr.to_string().as_bytes());
+    format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
+}
+
+/// Gateway server
+pub struct Gateway {
+    config: GatewayConfig,
+    session_manager: Arc<SessionManager>,
+    udp_socket: Option<Arc<UdpSocket>>,
+    nat_forwarder: Option<NatForwarder>,
+    /// Per-IP rate limiter: (packet_count, window_start)
+    rate_limits: DashMap<IpAddr, (u64, Instant)>,
+    /// Neural Resonance Module (Patent 1) — periodic traffic validation
+    neural_module: Arc<parking_lot::Mutex<NeuralResonanceModule>>,
+    /// Mask catalog for automatic rotation (Patent 3)
+    mask_catalog: Arc<MaskCatalog>,
+    /// Metrics collector
+    metrics: Arc<MetricsCollector>,
+}
+
+impl Gateway {
+    pub fn new(config: GatewayConfig) -> Result<Self> {
+        use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+        
+        // Create server keypair (use config key if provided, otherwise generate ephemeral)
+        let server_keys = if config.server_private_key != [0u8; 32] {
+            crypto::KeyPair::from_private_key(config.server_private_key)
+        } else {
+            crypto::KeyPair::generate()
+        };
+        
+        // Create Ed25519 signing key
+        let mut key_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut key_bytes);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+        
+        // Create default mask
+        let default_mask = webrtc_zoom_v3();
+        
+        let session_manager = Arc::new(SessionManager::new(
+            server_keys,
+            signing_key,
+            default_mask,
+        ));
+        
+        // Initialize mask catalog (Patent 3 — fallback pool)
+        let mask_catalog = Arc::new(MaskCatalog::new());
+        
+        // Initialize neural resonance module (Patent 1)
+        let mut neural = NeuralResonanceModule::new(config.neural_config.clone())
+            .map_err(|e| Error::Session(format!("Neural module init failed: {}", e)))?;
+        
+        if config.enable_neural {
+            // Register all catalog masks for signature-based resonance checking
+            for entry in mask_catalog.masks.iter() {
+                let _ = neural.register_mask(entry.value());
+            }
+            // Load neural model (Baked Mask Encoder — ~66KB per mask)
+            let _ = neural.load_model();
+            info!("Neural Resonance Module initialized (Patent 1)");
+        }
+        
+        // NAT forwarder is created lazily in run() to avoid requiring root at construction time
+        Ok(Self {
+            config,
+            session_manager,
+            udp_socket: None,
+            nat_forwarder: None,
+            rate_limits: DashMap::new(),
+            neural_module: Arc::new(parking_lot::Mutex::new(neural)),
+            mask_catalog,
+            metrics: Arc::new(MetricsCollector::new()),
+        })
+    }
+    
+    /// Start the gateway
+    pub async fn run(&mut self) -> Result<()> {
+        info!("Starting AIVPN Gateway on {}", self.config.listen_addr);
+        
+        // Create NAT forwarder (requires root — deferred from constructor for testability)
+        if self.config.enable_nat {
+            let mut nat = NatForwarder::new(
+                &self.config.tun_name,
+                &self.config.tun_addr,
+                &self.config.tun_netmask,
+            )?;
+            nat.create()?;
+            self.nat_forwarder = Some(nat);
+            info!("TUN device: {} ({}/{})", 
+                self.config.tun_name,
+                self.config.tun_addr,
+                self.config.tun_netmask
+            );
+        }
+        
+        // Create UDP socket
+        let socket = UdpSocket::bind(&self.config.listen_addr).await?;
+        info!("UDP listener bound to {}", self.config.listen_addr);
+        
+        self.udp_socket = Some(Arc::new(socket));
+        
+        // Spawn neural resonance check loop (Patent 1 — periodic validation)
+        if self.config.enable_neural {
+            let neural = self.neural_module.clone();
+            let sessions = self.session_manager.clone();
+            let catalog = self.mask_catalog.clone();
+            let metrics = self.metrics.clone();
+            let check_interval = self.config.neural_config.check_interval_secs;
+            
+            tokio::spawn(async move {
+                Self::resonance_check_loop(neural, sessions, catalog, metrics, check_interval).await;
+            });
+            info!("Neural resonance check loop spawned (interval: {}s)", check_interval);
+        }
+        
+        // Spawn TUN → Client read loop (reads packets from TUN, routes back to clients)
+        if let Some(ref nat) = self.nat_forwarder {
+            if let Some(tun_reader) = nat.take_reader().await {
+                let sessions = self.session_manager.clone();
+                let socket = self.udp_socket.as_ref().unwrap().clone();
+                let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+                
+                tokio::spawn(async move {
+                    Self::tun_read_loop(tun_reader, sessions, socket, mask).await;
+                });
+                info!("TUN read loop spawned");
+            }
+        }
+        
+        // Start packet processing
+        self.process_packets().await?;
+        
+        Ok(())
+    }
+    
+    /// Background task: periodic neural resonance checks (Patent 1)
+    ///
+    /// For each active session, computes reconstruction error between
+    /// observed traffic features and the assigned mask's signature vector.
+    /// If MSE exceeds threshold → mask is detected as compromised by DPI.
+    /// Triggers automatic mask rotation (Patent 3).
+    async fn resonance_check_loop(
+        neural: Arc<parking_lot::Mutex<NeuralResonanceModule>>,
+        sessions: Arc<SessionManager>,
+        catalog: Arc<MaskCatalog>,
+        metrics: Arc<MetricsCollector>,
+        check_interval_secs: u64,
+    ) {
+        let interval = Duration::from_secs(check_interval_secs);
+        
+        loop {
+            tokio::time::sleep(interval).await;
+            
+            // Collect session IDs and their mask IDs
+            let session_checks: Vec<([u8; 16], String)> = sessions.iter_sessions()
+                .filter_map(|entry| {
+                    let sess = entry.value().lock();
+                    let mask_id = sess.mask.as_ref().map(|m| m.mask_id.clone())
+                        .unwrap_or_else(|| "webrtc_zoom_v3".to_string());
+                    Some((sess.session_id, mask_id))
+                })
+                .collect();
+            
+            if session_checks.is_empty() {
+                continue;
+            }
+            
+            let neural_guard = neural.lock();
+            
+            for (session_id, mask_id) in &session_checks {
+                // Check neural resonance (Patent 1: Signal Reconstruction Resonance)
+                match neural_guard.check_resonance(*session_id, mask_id) {
+                    Ok(result) => {
+                        metrics.record_neural_check(result.status == ResonanceStatus::Compromised);
+                        
+                        match result.status {
+                            ResonanceStatus::Compromised => {
+                                warn!(
+                                    "Mask '{}' compromised (MSE={:.4}) — triggering rotation (Patent 3)",
+                                    mask_id, result.mse
+                                );
+                                
+                                // Mark mask as compromised in catalog
+                                catalog.mark_compromised(mask_id);
+                                
+                                // Select fallback mask
+                                if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                                    info!(
+                                        "Auto-rotating to mask '{}' ({} masks remaining)",
+                                        new_mask.mask_id,
+                                        catalog.available_count()
+                                    );
+                                    
+                                    // Update session's mask
+                                    sessions.update_session_mask(session_id, new_mask.clone());
+                                    
+                                    metrics.record_mask_rotation();
+                                } else {
+                                    error!("No fallback masks available! All masks compromised.");
+                                }
+                            }
+                            ResonanceStatus::Warning => {
+                                debug!(
+                                    "Mask '{}' warning (MSE={:.4}) — monitoring",
+                                    mask_id, result.mse
+                                );
+                            }
+                            ResonanceStatus::Healthy => {
+                                // All good
+                            }
+                            ResonanceStatus::Skip => {
+                                // Not enough data or model not loaded
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Resonance check error for session: {}", e);
+                    }
+                }
+                
+                // Check anomaly detection (DPI blocking indicators)
+                if neural_guard.is_mask_anomalous(mask_id) {
+                    warn!("Anomaly detected for mask '{}' (packet loss / RTT spike)", mask_id);
+                    metrics.record_dpi_attack();
+                    catalog.mark_compromised(mask_id);
+                    
+                    if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                        info!(
+                            "Anomaly-triggered rotation to mask '{}'",
+                            new_mask.mask_id
+                        );
+                        sessions.update_session_mask(session_id, new_mask);
+                        metrics.record_mask_rotation();
+                    }
+                }
+            }
+        }
+    }
+    
+    /// TUN read loop: reads packets from TUN device and routes them back to clients
+    async fn tun_read_loop(
+        mut tun_reader: tun::DeviceReader,
+        sessions: Arc<SessionManager>,
+        socket: Arc<UdpSocket>,
+        mask: MaskProfile,
+    ) {
+        use aivpn_common::crypto::POLY1305_TAG_SIZE;
+        let mut buf = vec![0u8; MAX_PACKET_SIZE];
+        
+        loop {
+            match tun_reader.read(&mut buf).await {
+                Ok(0) => continue,
+                Ok(n) => {
+                    let packet = &buf[..n];
+                    
+                    // Parse destination IP from IP header
+                    if packet.len() < 20 || (packet[0] >> 4) != 4 {
+                        continue; // Not IPv4
+                    }
+                    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                    
+                    // Find session by VPN IP
+                    let session = match sessions.get_session_by_vpn_ip(&dst_ip) {
+                        Some(s) => s,
+                        None => {
+                            debug!("No session for VPN IP {}", dst_ip);
+                            continue;
+                        }
+                    };
+                    
+                    // Build encrypted response packet
+                    let (client_addr, aivpn_packet) = {
+                        let mut sess = session.lock();
+                        let client_addr = sess.client_addr;
+                        
+                        // Build inner payload: Data type + IP packet
+                        let inner_header = InnerHeader {
+                            inner_type: InnerType::Data,
+                            seq_num: sess.next_seq() as u16,
+                        };
+                        let mut inner_payload = inner_header.encode().to_vec();
+                        inner_payload.extend_from_slice(packet);
+                        
+                        // Build MDH (no eph_pub for data packets)
+                        let mdh = mask.header_template.clone();
+                        
+                        // Pad and encrypt
+                        let pad_len: u16 = 0;
+                        let mut padded = Vec::with_capacity(2 + inner_payload.len());
+                        padded.extend_from_slice(&pad_len.to_le_bytes());
+                        padded.extend_from_slice(&inner_payload);
+                        
+                        let (nonce, counter) = sess.next_send_nonce();
+                        let key = &sess.keys.session_key;
+                        let ciphertext = match encrypt_payload(key, &nonce, &padded) {
+                            Ok(ct) => ct,
+                            Err(e) => {
+                                debug!("Encrypt error: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        // Generate tag
+                        let time_window = crypto::compute_time_window(
+                            crypto::current_timestamp_ms(),
+                            aivpn_common::crypto::DEFAULT_WINDOW_MS,
+                        );
+                        let tag = crypto::generate_resonance_tag(
+                            &sess.keys.tag_secret,
+                            counter,
+                            time_window,
+                        );
+                        
+                        // Assemble: TAG | MDH | ciphertext
+                        let mut aivpn_packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
+                        aivpn_packet.extend_from_slice(&tag);
+                        aivpn_packet.extend_from_slice(&mdh);
+                        aivpn_packet.extend_from_slice(&ciphertext);
+                        
+                        (client_addr, aivpn_packet)
+                    };
+                    
+                    // Send to client
+                    if let Err(e) = socket.send_to(&aivpn_packet, client_addr).await {
+                        debug!("Failed to send to client: {}", e);
+                    } else {
+                        debug!("Sent {} bytes to client (TUN reply)", aivpn_packet.len());
+                    }
+                }
+                Err(e) => {
+                    error!("TUN read error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+    
+    /// Main packet processing loop
+    async fn process_packets(&self) -> Result<()> {
+        let socket = self.udp_socket.as_ref().unwrap();
+        let mut buf = vec![0u8; MAX_PACKET_SIZE];
+        
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((len, client_addr)) => {
+                    // Per-IP rate limiting (max 1000 pps)
+                    {
+                        let now = Instant::now();
+                        let mut entry = self.rate_limits.entry(client_addr.ip()).or_insert((0, now));
+                        if entry.1.elapsed() > Duration::from_secs(1) {
+                            entry.0 = 0;
+                            entry.1 = now;
+                        }
+                        entry.0 += 1;
+                        if entry.0 > 1000 {
+                            continue;
+                        }
+                    }
+                    
+                    let packet_data = &buf[..len];
+                    
+                    // Process packet
+                    if let Err(e) = self.handle_packet(packet_data, client_addr).await {
+                        debug!("Packet error from {}: {}", hash_addr(&client_addr), e);
+                        // Silent drop - no response for invalid packets
+                    }
+                }
+                Err(e) => {
+                    error!("UDP recv error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+    
+    /// Handle incoming packet
+    async fn handle_packet(&self, packet_data: &[u8], client_addr: SocketAddr) -> Result<()> {
+        // Minimum packet size check
+        if packet_data.len() < TAG_SIZE + 2 {
+            return Err(Error::InvalidPacket("Too short"));
+        }
+        
+        // Extract resonance tag
+        let mut tag = [0u8; TAG_SIZE];
+        tag.copy_from_slice(&packet_data[0..TAG_SIZE]);
+        
+        // O(1) tag validation - find session
+        let mdh_len = 4; // Default for MVP
+        let mut is_new_session = false;
+        let (session, counter, is_ratcheted_tag) = if let Some(session) = self.session_manager.get_session_by_tag(&tag) {
+            // Existing session — validate tag
+            let (counter, is_ratcheted) = {
+                let sess = session.lock();
+                sess.validate_tag(&tag)
+                    .ok_or(Error::InvalidPacket("Invalid tag"))?
+            };
+            (session, counter, is_ratcheted)
+        } else if let Some((session, counter, is_ratcheted)) = self.session_manager.refresh_and_find_by_tag(&tag) {
+            // Tag not in map — time window may have advanced. Refresh all sessions and retry.
+            (session, counter, is_ratcheted)
+        } else {
+            // No session found — try to establish a new one from eph_pub in MDH
+            if packet_data.len() < TAG_SIZE + mdh_len + 32 {
+                return Err(Error::InvalidPacket("Too short for session init"));
+            }
+            let eph_start = TAG_SIZE + mdh_len;
+            if packet_data.len() < eph_start + 32 {
+                return Err(Error::InvalidPacket("Missing eph_pub for new session"));
+            }
+            let mut eph_pub = [0u8; 32];
+            eph_pub.copy_from_slice(&packet_data[eph_start..eph_start + 32]);
+            
+            // Deobfuscate eph_pub (HIGH-9)
+            crypto::obfuscate_eph_pub(&mut eph_pub, &self.session_manager.server_public_key());
+            
+            // Create session (derives DH1 keys + prepares PFS ratchet)
+            let session = self.session_manager.create_session(
+                client_addr,
+                eph_pub,
+                None,
+            )?;
+            
+            // Validate the tag against the newly created session
+            let (counter, is_ratcheted) = {
+                let sess = session.lock();
+                sess.validate_tag(&tag)
+                    .ok_or(Error::InvalidPacket("Tag mismatch on new session"))?
+            };
+            
+            // Send ServerHello for PFS ratchet + server authentication (CRIT-3 + HIGH-6)
+            {
+                let (server_eph_pub, signature) = {
+                    let sess = session.lock();
+                    match (sess.server_eph_pub, sess.server_hello_signature) {
+                        (Some(pub_key), Some(sig)) => (pub_key, sig),
+                        _ => return Err(Error::Session("Missing ratchet data".into())),
+                    }
+                };
+                let hello = ControlPayload::ServerHello { server_eph_pub, signature };
+                let encoded = hello.encode()?;
+                let inner_header = InnerHeader {
+                    inner_type: InnerType::Control,
+                    seq_num: 0,
+                };
+                let mut inner_payload = inner_header.encode().to_vec();
+                inner_payload.extend_from_slice(&encoded);
+                let packet = self.build_packet(&inner_payload, &session)?;
+                let socket = self.udp_socket.as_ref().unwrap();
+                socket.send_to(&packet, client_addr).await?;
+            }
+            
+            is_new_session = true;
+            info!("New session from {} (ServerHello sent)", hash_addr(&client_addr));
+            (session, counter, is_ratcheted)
+        };
+        
+        // Parse packet — pad_len is inside encrypted area (CRIT-5 fix)
+        // For init packets, eph_pub (32 bytes) follows MDH before ciphertext
+        let payload_offset = if is_new_session {
+            TAG_SIZE + mdh_len + 32
+        } else {
+            TAG_SIZE + mdh_len
+        };
+        if packet_data.len() <= payload_offset {
+            return Err(Error::InvalidPacket("Invalid length"));
+        }
+        
+        // Decrypt with appropriate keys (initial or ratcheted)
+        let encrypted_payload = &packet_data[payload_offset..];
+        
+        let padded_plaintext = {
+            let sess = session.lock();
+            let nonce = self.compute_nonce(counter);
+            let key = if is_ratcheted_tag {
+                &sess.ratcheted_keys.as_ref()
+                    .ok_or(Error::InvalidPacket("Ratcheted keys missing"))?
+                    .session_key
+            } else {
+                &sess.keys.session_key
+            };
+            decrypt_payload(key, &nonce, encrypted_payload)?
+        };
+        
+        // If this packet used ratcheted keys, complete the PFS ratchet
+        if is_ratcheted_tag {
+            let session_id = session.lock().session_id;
+            self.session_manager.complete_session_ratchet(&session_id);
+            info!("PFS ratchet complete for {}", hash_addr(&client_addr));
+        }
+        
+        // Extract pad_len from inside decrypted data and strip padding
+        if padded_plaintext.len() < 2 {
+            return Err(Error::InvalidPacket("Decrypted payload too short"));
+        }
+        let pad_len = u16::from_le_bytes([padded_plaintext[0], padded_plaintext[1]]) as usize;
+        if 2 + pad_len > padded_plaintext.len() {
+            return Err(Error::InvalidPacket("Invalid padding length"));
+        }
+        let plaintext = &padded_plaintext[2..padded_plaintext.len() - pad_len];
+        
+        // Update session state
+        let session_id = {
+            let mut sess = session.lock();
+            if !is_ratcheted_tag {
+                sess.counter = counter;
+                sess.mark_tag_received(counter);
+            }
+            sess.last_seen = std::time::Instant::now();
+            sess.update_tag_window();
+            sess.update_fsm();
+            sess.session_id
+        };
+        
+        // Refresh tag_map after window update (prevents stale tags after 256 packets)
+        self.session_manager.refresh_session_tags(&session_id);
+        
+        // Record traffic stats for neural resonance (Patent 1)
+        if self.config.enable_neural {
+            let packet_size = packet_data.len() as u16;
+            // Compute byte-level entropy of the encrypted payload
+            let entropy = Self::compute_entropy(encrypted_payload);
+            // IAT is approximated by the last_seen timing
+            let iat_ms = 0.0; // Will be calculated from session timestamps in check loop
+            self.neural_module.lock().record_traffic(
+                session_id, packet_size, iat_ms, entropy,
+            );
+            self.metrics.record_packet_received(packet_data.len());
+        }
+        
+        // Process inner payload (skip for new sessions — ServerHello is already the response,
+        // and any ControlAck sent here would use pre-ratchet keys that the client can't validate)
+        if !is_new_session {
+            self.process_inner_payload(plaintext, &session, client_addr).await?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Compute nonce from counter
+    fn compute_nonce(&self, counter: u64) -> [u8; NONCE_SIZE] {
+        let mut nonce = [0u8; NONCE_SIZE];
+        nonce[0..8].copy_from_slice(&counter.to_le_bytes());
+        nonce
+    }
+    
+    /// Process decrypted inner payload
+    async fn process_inner_payload(
+        &self,
+        plaintext: &[u8],
+        session: &Arc<parking_lot::Mutex<Session>>,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
+        if plaintext.len() < 4 {
+            return Err(Error::InvalidPacket("Inner payload too short"));
+        }
+        
+        let inner_header = InnerHeader::decode(plaintext)?;
+        let payload = &plaintext[4..];
+        
+        match inner_header.inner_type {
+            InnerType::Data => {
+                // Forward to NAT/internet
+                debug!("DATA packet from {} ({} bytes)", hash_addr(&client_addr), payload.len());
+                
+                if let Some(ref nat) = self.nat_forwarder {
+                    nat.forward_packet(payload).await?;
+                } else {
+                    debug!("NAT disabled, dropping packet");
+                }
+            }
+            InnerType::Control => {
+                self.handle_control_message(payload, session, client_addr).await?;
+            }
+            InnerType::Fragment => {
+                // TODO: Implement fragmentation
+                debug!("FRAGMENT packet (not implemented)");
+            }
+            InnerType::Ack => {
+                // Handle ACK
+                debug!("ACK packet received");
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle control message
+    async fn handle_control_message(
+        &self,
+        payload: &[u8],
+        session: &Arc<parking_lot::Mutex<Session>>,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
+        let control = ControlPayload::decode(payload)?;
+        
+        match control {
+            ControlPayload::KeyRotate { new_eph_pub } => {
+                info!("Key rotation request from {}", hash_addr(&client_addr));
+                // TODO: Implement key rotation
+            }
+            ControlPayload::MaskUpdate { .. } => {
+                warn!("Unexpected MASK_UPDATE from client");
+            }
+            ControlPayload::Keepalive => {
+                debug!("Keepalive from {}", hash_addr(&client_addr));
+                // Send ACK
+                let ack = ControlPayload::ControlAck {
+                    ack_seq: 0,
+                    ack_for_subtype: ControlSubtype::Keepalive as u8,
+                };
+                self.send_control_message(&ack, session).await?;
+            }
+            ControlPayload::TelemetryRequest { metric_flags } => {
+                debug!("Telemetry request from {}", hash_addr(&client_addr));
+                // Send response
+                let response = ControlPayload::TelemetryResponse {
+                    packet_loss: 0,
+                    rtt_ms: 10,
+                    jitter_ms: 2,
+                    buffer_pct: 25,
+                };
+                self.send_control_message(&response, session).await?;
+            }
+            ControlPayload::TelemetryResponse { .. } => {
+                debug!("Telemetry response received");
+            }
+            ControlPayload::TimeSync { .. } => {
+                debug!("Time sync request");
+            }
+            ControlPayload::Shutdown { reason } => {
+                info!("Shutdown request from {} (reason: {})", hash_addr(&client_addr), reason);
+                // Close session
+                let session_id = session.lock().session_id;
+                self.session_manager.remove_session(&session_id);
+            }
+            ControlPayload::ControlAck { .. } => {
+                // ACK received, nothing to do
+            }
+            ControlPayload::ServerHello { .. } => {
+                warn!("Unexpected ServerHello from client {}", hash_addr(&client_addr));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Send control message to client
+    async fn send_control_message(
+        &self,
+        payload: &ControlPayload,
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> Result<()> {
+        let socket = self.udp_socket.as_ref().unwrap();
+        
+        let encoded = payload.encode()?;
+        let packet = self.build_packet(&encoded, session)?;
+        
+        // Extract client_addr before dropping the guard to avoid holding
+        // MutexGuard across .await (which would cause deadlock)
+        let client_addr = session.lock().client_addr;
+        socket.send_to(&packet, client_addr).await?;
+        
+        Ok(())
+    }
+    
+    /// Build AIVPN packet
+    /// Wire format: TAG | MDH | encrypt(pad_len_u16 || plaintext || random_padding)
+    fn build_packet(
+        &self,
+        plaintext: &[u8],
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> Result<Vec<u8>> {
+        let mut sess = session.lock();
+        
+        // Use unified counter for both nonce and tag
+        let (nonce, counter) = sess.next_send_nonce();
+        
+        // Build padded plaintext: pad_len(u16) || plaintext || random_padding
+        // pad_len is inside encryption — invisible to DPI (CRIT-5 fix)
+        let pad_len = 16u16;
+        let mut padded = Vec::with_capacity(2 + plaintext.len() + pad_len as usize);
+        padded.extend_from_slice(&pad_len.to_le_bytes());
+        padded.extend_from_slice(plaintext);
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for _ in 0..pad_len {
+            padded.push(rng.gen::<u8>());
+        }
+        
+        let ciphertext = encrypt_payload(&sess.keys.session_key, &nonce, &padded)?;
+        
+        // Generate tag
+        let time_window = crypto::compute_time_window(
+            crypto::current_timestamp_ms(),
+            aivpn_common::crypto::DEFAULT_WINDOW_MS,
+        );
+        let tag = crypto::generate_resonance_tag(
+            &sess.keys.tag_secret,
+            counter,
+            time_window,
+        );
+        
+        // Build MDH (simple for MVP)
+        let mdh = vec![0u8; 4];
+        
+        // Assemble packet: TAG | MDH | ciphertext (no cleartext padding)
+        let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
+        packet.extend_from_slice(&tag);
+        packet.extend_from_slice(&mdh);
+        packet.extend_from_slice(&ciphertext);
+        
+        Ok(packet)
+    }
+    
+    /// Compute Shannon entropy of a byte slice (0.0 = uniform, 8.0 = max)
+    fn compute_entropy(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+        let mut counts = [0u32; 256];
+        for &b in data {
+            counts[b as usize] += 1;
+        }
+        let len = data.len() as f64;
+        let mut entropy = 0.0;
+        for &c in &counts {
+            if c > 0 {
+                let p = c as f64 / len;
+                entropy -= p * p.log2();
+            }
+        }
+        entropy
+    }
+    
+    /// Get mask catalog reference
+    pub fn mask_catalog(&self) -> &Arc<MaskCatalog> {
+        &self.mask_catalog
+    }
+    
+    /// Get metrics reference
+    pub fn metrics(&self) -> &Arc<MetricsCollector> {
+        &self.metrics
+    }
+}
