@@ -678,9 +678,10 @@ impl SessionManager {
             for tag in sess.ratcheted_expected_tags.values() {
                 self.tag_map.remove(tag);
             }
-            // Remove VPN IP mapping
+            // Remove VPN IP mapping only if it still points to THIS session.
+            // A newer session may have already claimed the same VPN IP.
             if let Some(vpn_ip) = sess.vpn_ip {
-                self.vpn_ip_map.remove(&vpn_ip);
+                self.vpn_ip_map.remove_if(&vpn_ip, |_, sid| sid == session_id);
             }
         }
     }

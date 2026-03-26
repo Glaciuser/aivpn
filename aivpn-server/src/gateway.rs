@@ -419,7 +419,7 @@ impl Gateway {
                     let session = match sessions.get_session_by_vpn_ip(&dst_ip) {
                         Some(s) => s,
                         None => {
-                            debug!("No session for VPN IP {}", dst_ip);
+                            debug!("TUN: no session for VPN IP {}", dst_ip);
                             continue;
                         }
                     };
@@ -447,11 +447,12 @@ impl Gateway {
                         padded.extend_from_slice(&inner_payload);
                         
                         let (nonce, counter) = sess.next_send_nonce();
+                        info!("TUN→client: counter={}, is_ratcheted={}, dst_ip={}", counter, sess.is_ratcheted, dst_ip);
                         let key = &sess.keys.session_key;
                         let ciphertext = match encrypt_payload(key, &nonce, &padded) {
                             Ok(ct) => ct,
                             Err(e) => {
-                                debug!("Encrypt error: {}", e);
+                                debug!("TUN: encrypt error: {}", e);
                                 continue;
                             }
                         };
@@ -478,9 +479,7 @@ impl Gateway {
                     
                     // Send to client
                     if let Err(e) = socket.send_to(&aivpn_packet, client_addr).await {
-                        debug!("Failed to send to client: {}", e);
-                    } else {
-                        debug!("Sent {} bytes to client (TUN reply)", aivpn_packet.len());
+                        debug!("TUN: send failed: {}", e);
                     }
                 }
                 Err(e) => {
@@ -722,7 +721,9 @@ impl Gateway {
             let session_id = session.lock().session_id;
             self.session_manager.complete_session_ratchet(&session_id);
             self.session_manager.refresh_session_tags(&session_id);
-            info!("PFS ratchet complete for {}", hash_addr(&client_addr));
+            let sess = session.lock();
+            info!("PFS ratchet complete for {} — send_counter={}, counter={}", 
+                hash_addr(&client_addr), sess.send_counter, sess.counter);
         }
         
         // Extract pad_len from inside decrypted data and strip padding
@@ -917,6 +918,7 @@ impl Gateway {
         
         // Use unified counter for both nonce and tag
         let (nonce, counter) = sess.next_send_nonce();
+        info!("build_packet: counter={}, is_ratcheted={}", counter, sess.is_ratcheted);
         
         // Build padded plaintext: pad_len(u16) || plaintext || random_padding
         // pad_len is inside encryption — invisible to DPI (CRIT-5 fix)
