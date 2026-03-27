@@ -73,6 +73,15 @@ fi
 # Copy Info.plist
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
 
+# Copy app icon
+if [ -f "/tmp/Aivpn.icns" ]; then
+    cp /tmp/Aivpn.icns "$RESOURCES/AppIcon.icns"
+    echo "  ✅ App icon bundled"
+elif [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+    cp "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+    echo "  ✅ App icon bundled"
+fi
+
 # Copy entitlements
 cp "$SCRIPT_DIR/Aivpn.entitlements" "$CONTENTS/Resources/"
 

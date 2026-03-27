@@ -36,15 +36,11 @@ class VPNManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            let process = Process()
-            self.clientProcess = process
-
             // Find aivpn-client binary
             let binaryPath = Bundle.main.bundlePath + "/Contents/Resources/aivpn-client"
             let fallbackPaths = [
                 "/usr/local/bin/aivpn-client",
                 "/opt/homebrew/bin/aivpn-client",
-                Bundle.main.executablePath?.replacingOccurrences(of: "Aivpn", with: "aivpn-client") ?? ""
             ]
 
             var execPath = binaryPath
@@ -57,11 +53,42 @@ class VPNManager: ObservableObject {
                 }
             }
 
-            process.executableURL = URL(fileURLWithPath: execPath)
-            process.arguments = ["-k", key]
+            // Build the command to run with sudo
+            var args = [execPath, "-k", key]
             if fullTunnel {
-                process.arguments?.append("--full-tunnel")
+                args.append("--full-tunnel")
             }
+
+            // Use AppleScript to get admin privileges
+            let argString = args.map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }.joined(separator: " ")
+            // We need to run the process in background, so use a wrapper script
+            let wrapperScript = """
+            #!/bin/bash
+            \(argString) &
+            echo $!
+            """
+
+            // Write wrapper to temp file
+            let tmpDir = NSTemporaryDirectory()
+            let wrapperPath = tmpDir + "aivpn_connect.sh"
+            try? wrapperScript.write(toFile: wrapperPath, atomically: true, encoding: .utf8)
+
+            // Make executable
+            let chmodProcess = Process()
+            chmodProcess.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            chmodProcess.arguments = ["+x", wrapperPath]
+            try? chmodProcess.run()
+            chmodProcess.waitUntilExit()
+
+            DispatchQueue.main.async {
+                self.lastError = nil
+            }
+
+            // Run the actual process directly (user will be prompted for password)
+            let process = Process()
+            self.clientProcess = process
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            process.arguments = args
 
             let outputPipe = Pipe()
             let errorPipe = Pipe()
@@ -70,7 +97,6 @@ class VPNManager: ObservableObject {
             process.standardOutput = outputPipe
             process.standardError = errorPipe
 
-            // Read output
             outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
@@ -107,7 +133,16 @@ class VPNManager: ObservableObject {
     }
 
     func disconnect() {
-        clientProcess?.terminate()
+        // Kill the aivpn-client process
+        if let process = clientProcess {
+            process.terminate()
+            // Also try to kill via sudo kill
+            let killProcess = Process()
+            killProcess.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            killProcess.arguments = ["killall", "aivpn-client"]
+            try? killProcess.run()
+            killProcess.waitUntilExit()
+        }
         clientProcess = nil
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         errorPipe?.fileHandleForReading.readabilityHandler = nil
@@ -124,7 +159,6 @@ class VPNManager: ObservableObject {
         let lines = output.components(separatedBy: "\n")
 
         for line in lines {
-            // Check for connection success
             if line.contains("PFS ratchet complete") || line.contains("forward secrecy established") {
                 DispatchQueue.main.async {
                     self.isConnecting = false
@@ -133,21 +167,18 @@ class VPNManager: ObservableObject {
                 }
             }
 
-            // Check for TUN device creation (connection in progress)
             if line.contains("Created TUN device") {
                 DispatchQueue.main.async {
                     self.isConnecting = true
                 }
             }
 
-            // Check for errors
             if line.contains("ERROR") || line.contains("error") || line.contains("Failed") {
                 DispatchQueue.main.async {
                     self.lastError = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             }
 
-            // Parse traffic stats from output
             if let range = line.range(of: "bytes_in=(\\d+)", options: .regularExpression) {
                 let numStr = line[range].replacingOccurrences(of: "bytes_in=", with: "")
                 if let bytes = Int64(numStr) {
