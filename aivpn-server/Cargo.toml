@@ -43,7 +43,7 @@ thiserror.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 base64 = "0.22"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 
 # Monitoring (Phase 5)
 prometheus = { version = "0.13", optional = true }
