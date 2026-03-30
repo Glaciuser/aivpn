@@ -196,6 +196,12 @@ impl Tunnel {
             info!("✓ Added subnet route 10.0.0.0/24 via {} (gateway {})", tun_name, tun_addr);
         }
 
+        // Disable IPv6 to prevent traffic leak (IPv6 bypasses VPN tunnel)
+        info!("Disabling IPv6 to prevent traffic leak...");
+        let _ = Command::new("/sbin/route").args(["-n", "delete", "-inet6", "default"]).status();
+        let _ = Command::new("/sbin/route").args(["-n", "add", "-inet6", "-net", "::/0", "-blackhole"]).status();
+        info!("IPv6 disabled - all traffic will use IPv4 VPN tunnel");
+
         // Verify routes
         info!("Verifying routes...");
         let output = Command::new("netstat")
