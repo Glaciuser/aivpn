@@ -76,7 +76,18 @@ class MainActivity : AppCompatActivity() {
             toggleLanguage()
         }
 
-        // Listen for service status updates
+        // Restore connection state if service is already running
+        if (AivpnService.isRunning) {
+            isConnected = true
+            updateUI(true, AivpnService.lastStatusText)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Register callbacks when activity becomes visible.
+        // Using onResume/onPause instead of onCreate/onDestroy prevents the race condition
+        // where a destroyed (rotated) Activity nullifies callbacks registered by the new one.
         AivpnService.statusCallback = { connected, statusText ->
             runOnUiThread {
                 isConnected = connected
@@ -84,19 +95,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Listen for traffic stats updates
         AivpnService.trafficCallback = { uploadBytes, downloadBytes ->
             runOnUiThread {
                 binding.textUpload.text = formatBytes(uploadBytes)
                 binding.textDownload.text = formatBytes(downloadBytes)
             }
         }
+    }
 
-        // Restore connection state if service is already running
-        if (AivpnService.isRunning) {
-            isConnected = true
-            updateUI(true, AivpnService.lastStatusText)
-        }
+    override fun onPause() {
+        super.onPause()
+        // Unregister callbacks when activity is no longer in foreground
+        AivpnService.statusCallback = null
+        AivpnService.trafficCallback = null
     }
 
     /**
@@ -236,8 +247,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        AivpnService.statusCallback = null
-        AivpnService.trafficCallback = null
         timerHandler.removeCallbacks(timerRunnable)
         super.onDestroy()
     }
