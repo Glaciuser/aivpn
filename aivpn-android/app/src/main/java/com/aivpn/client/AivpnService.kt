@@ -12,7 +12,6 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
-import android.system.OsConstants.AF_INET
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.selects.select
@@ -247,18 +246,14 @@ class AivpnService : VpnService() {
         lastReceiveTime = System.currentTimeMillis()
 
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
-        val tunAddress6 = "fd00::2"
-        Log.d(TAG, "Establishing TUN interface: IPv4=$tunAddress4 IPv6=$tunAddress6")
+        Log.d(TAG, "Establishing TUN interface: IPv4=$tunAddress4")
+        // IPv4-only TUN — server does not support IPv6 tunnelling yet.
+        // IPv6 traffic bypasses the VPN on the physical network rather than
+        // being silently dropped, which prevents TCP/app hangs waiting for ACK.
         val builder = Builder()
             .setSession("AIVPN")
-            .allowFamily(AF_INET)
-            // Capture both families in the VPN. IPv6 packets are dropped locally until
-            // the server supports IPv6 tunnelling, which prevents them from leaking to
-            // the physical network and triggering IPv6/IPv4 oscillation.
             .addAddress(tunAddress4, 24)
             .addRoute("0.0.0.0", 0)
-            .addAddress(tunAddress6, 64)
-            .addRoute("::", 0)
             .addDnsServer("8.8.8.8")
             .addDnsServer("1.1.1.1")
             .setMtu(TUN_MTU)
@@ -321,11 +316,6 @@ class AivpnService : VpnService() {
                     continue
                 }
 
-                val ipVersion = (buf[0].toInt() ushr 4) and 0x0F
-                if (ipVersion == 6) {
-                    continue
-                }
-
                 val encrypted = crypto.encryptDataPacket(buf.copyOf(n))
                 socket.send(DatagramPacket(encrypted, encrypted.size))
                 lastSendTime = System.currentTimeMillis()
@@ -359,8 +349,10 @@ class AivpnService : VpnService() {
                     trafficCallback?.invoke(totalUploadBytes, totalDownloadBytes)
                 }
             } catch (e: SocketTimeoutException) {
-                val silence = System.currentTimeMillis() - lastReceiveTime
-                if (silence > DEAD_TUNNEL_TIMEOUT_MS) {
+                // Use max(rx, tx) so outbound keepalives count as activity.
+                // Prevents false dead-tunnel when server is silent but socket is live.
+                val lastActivity = maxOf(lastReceiveTime, lastSendTime)
+                if (System.currentTimeMillis() - lastActivity > DEAD_TUNNEL_TIMEOUT_MS) {
                     throw RuntimeException("Dead tunnel")
                 }
             } catch (e: Exception) {
@@ -422,6 +414,11 @@ class AivpnService : VpnService() {
                     val stillOnOldSession = sessionNetwork != null && sessionNetwork != network
 
                     if (stillValid && stillOnOldSession) {
+                        // Don't reconnect if tunnel received data in the last 10 s.
+                        if (System.currentTimeMillis() - lastReceiveTime < 10_000L) {
+                            Log.d(TAG, "Tunnel active, skipping WiFi upgrade")
+                            return@launch
+                        }
                         Log.d(TAG, "WiFi validated and stable - upgrading: $session -> $network")
                         targetNetwork = network
                         setUnderlyingNetworks(arrayOf(network))
