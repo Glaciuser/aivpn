@@ -190,7 +190,6 @@ class AivpnService : VpnService() {
     private suspend fun runTunnel() {
         val network = waitForNetwork()
         sessionNetwork = network
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
         val (host, port) = parseServerAddr(
             savedServerAddr ?: throw Exception("No server address")
@@ -212,12 +211,6 @@ class AivpnService : VpnService() {
         if (!protect(socket)) {
             socket.close()
             throw RuntimeException("protect() failed")
-        }
-
-        val activeNow = cm.activeNetwork
-        if (network != activeNow) {
-            socket.close()
-            throw RuntimeException("Stale network")
         }
 
         network.bindSocket(socket)
@@ -422,9 +415,22 @@ class AivpnService : VpnService() {
             override fun onAvailable(network: Network) {
                 val session = sessionNetwork ?: return
                 if (network == session) return
-                Log.d(TAG, "Network switch: $session -> $network")
-                setUnderlyingNetworks(arrayOf(network))
-                udpSocket?.close()
+                val newCaps = cm.getNetworkCapabilities(network) ?: return
+                val sessionIsWifi = cm.getNetworkCapabilities(session)
+                    ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+
+                if (newCaps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    Log.d(TAG, "Upgrading to WiFi: $session -> $network")
+                    setUnderlyingNetworks(arrayOf(network))
+                    udpSocket?.close()
+                    return
+                }
+
+                if (!sessionIsWifi) {
+                    Log.d(TAG, "Switching network: $session -> $network")
+                    setUnderlyingNetworks(arrayOf(network))
+                    udpSocket?.close()
+                }
             }
 
             override fun onLost(network: Network) {
@@ -474,7 +480,12 @@ class AivpnService : VpnService() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         while (currentCoroutineContext().isActive) {
             val network = cm.activeNetwork
-            if (network != null && !isVpnNetwork(network)) return network
+            if (network != null) {
+                val caps = cm.getNetworkCapabilities(network)
+                if (caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                    return network
+                }
+            }
             delay(300L)
         }
         throw CancellationException("Cancelled while waiting for network")
