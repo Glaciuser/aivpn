@@ -47,6 +47,28 @@ impl RuntimeMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_filter(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct ClientArgs {
@@ -94,6 +116,10 @@ struct ClientArgs {
     #[arg(long)]
     local_socks5_max_concurrent_dials: Option<usize>,
 
+    /// Log level: error, warn, info, debug, trace
+    #[arg(long, value_enum)]
+    log_level: Option<LogLevel>,
+
     /// JSON config file path
     #[arg(long)]
     config: Option<String>,
@@ -111,6 +137,7 @@ struct FileClientConfig {
     tun_addr: Option<String>,
     full_tunnel: Option<bool>,
     mode: Option<RuntimeMode>,
+    log_level: Option<LogLevel>,
     network_config: Option<ClientNetworkConfig>,
     local_socks5: Option<LocalSocks5Config>,
 }
@@ -134,15 +161,18 @@ struct RuntimeSettings {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = ClientArgs::parse();
-    let settings = match resolve_runtime_settings(&args) {
+    let file_config = match load_file_config(args.config.as_deref()) {
+        Ok(file_config) => file_config,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
+
+    init_logging(&args, &file_config);
+
+    let settings = match resolve_runtime_settings_with_file_config(&args, &file_config) {
         Ok(settings) => settings,
         Err(err) => {
             error!("{err}");
@@ -263,6 +293,13 @@ async fn main() {
 
 fn resolve_runtime_settings(args: &ClientArgs) -> Result<RuntimeSettings> {
     let file_config = load_file_config(args.config.as_deref())?;
+    resolve_runtime_settings_with_file_config(args, &file_config)
+}
+
+fn resolve_runtime_settings_with_file_config(
+    args: &ClientArgs,
+    file_config: &FileClientConfig,
+) -> Result<RuntimeSettings> {
     let mode = args.mode.or(file_config.mode).unwrap_or(RuntimeMode::Tun);
     let full_tunnel = args.full_tunnel || file_config.full_tunnel.unwrap_or(false);
 
@@ -292,6 +329,32 @@ fn resolve_runtime_settings(args: &ClientArgs) -> Result<RuntimeSettings> {
         full_tunnel,
         local_socks5,
     })
+}
+
+fn init_logging(args: &ClientArgs, file_config: &FileClientConfig) {
+    tracing_subscriber::fmt()
+        .with_env_filter(resolve_log_filter(args, file_config))
+        .init();
+}
+
+fn resolve_log_filter(
+    args: &ClientArgs,
+    file_config: &FileClientConfig,
+) -> tracing_subscriber::EnvFilter {
+    if let Some(level) = resolve_configured_log_level(args, file_config) {
+        return tracing_subscriber::EnvFilter::new(level.as_filter());
+    }
+
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(LogLevel::Info.as_filter())
+    })
+}
+
+fn resolve_configured_log_level(
+    args: &ClientArgs,
+    file_config: &FileClientConfig,
+) -> Option<LogLevel> {
+    args.log_level.or(file_config.log_level)
 }
 
 fn load_file_config(path: Option<&str>) -> Result<FileClientConfig> {
@@ -536,6 +599,7 @@ mod tests {
             local_socks5_port: None,
             local_socks5_max_clients: None,
             local_socks5_max_concurrent_dials: None,
+            log_level: None,
             config: None,
         };
 
@@ -557,6 +621,7 @@ mod tests {
             local_socks5_port: None,
             local_socks5_max_clients: None,
             local_socks5_max_concurrent_dials: None,
+            log_level: None,
             config: None,
         };
 
@@ -566,5 +631,61 @@ mod tests {
         assert_eq!(local_socks5.port, 1080);
         assert_eq!(local_socks5.max_clients, 256);
         assert_eq!(local_socks5.max_concurrent_dials, 128);
+    }
+
+    #[test]
+    fn cli_log_level_overrides_config_log_level() {
+        let args = ClientArgs {
+            server: None,
+            server_key: None,
+            connection_key: Some("aivpn://placeholder".into()),
+            mode: None,
+            tun_name: None,
+            tun_addr: None,
+            full_tunnel: false,
+            local_socks5_host: None,
+            local_socks5_port: None,
+            local_socks5_max_clients: None,
+            local_socks5_max_concurrent_dials: None,
+            log_level: Some(LogLevel::Warn),
+            config: None,
+        };
+        let file_config = FileClientConfig {
+            log_level: Some(LogLevel::Debug),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_configured_log_level(&args, &file_config),
+            Some(LogLevel::Warn)
+        );
+    }
+
+    #[test]
+    fn config_log_level_used_when_cli_is_absent() {
+        let args = ClientArgs {
+            server: None,
+            server_key: None,
+            connection_key: Some("aivpn://placeholder".into()),
+            mode: None,
+            tun_name: None,
+            tun_addr: None,
+            full_tunnel: false,
+            local_socks5_host: None,
+            local_socks5_port: None,
+            local_socks5_max_clients: None,
+            local_socks5_max_concurrent_dials: None,
+            log_level: None,
+            config: None,
+        };
+        let file_config = FileClientConfig {
+            log_level: Some(LogLevel::Error),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_configured_log_level(&args, &file_config),
+            Some(LogLevel::Error)
+        );
     }
 }

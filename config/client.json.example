@@ -1,6 +1,7 @@
 {
   "connection_key": "aivpn://YOUR_CONNECTION_KEY",
   "mode": "socks5",
+  "log_level": "warn",
   "local_socks5": {
     "host": "127.0.0.1",
     "port": 1080,

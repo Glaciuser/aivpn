@@ -444,11 +444,15 @@ async fn handle_connect(
                     bind_addr
                 );
             }
+            // `max_concurrent_dials` is intended to cap simultaneous upstream
+            // connect attempts, not the lifetime of established proxied
+            // connections. Active client sessions are already bounded by
+            // `max_clients`, so release the dial slot before starting relay I/O.
+            drop(dial_permit);
             send_reply(client, SOCKS5_REPLY_SUCCEEDED, bind_addr).await?;
             let _ = copy_bidirectional(client, &mut upstream)
                 .await
                 .map_err(Error::Io)?;
-            drop(dial_permit);
             Ok(())
         }
         Err(connect_err) => {

@@ -117,6 +117,7 @@ Example `client.json` for local SOCKS5 mode:
 {
   "connection_key": "aivpn://YOUR_CONNECTION_KEY",
   "mode": "socks5",
+  "log_level": "warn",
   "local_socks5": {
     "host": "127.0.0.1",
     "port": 1080,
@@ -514,6 +515,7 @@ For OpenWrt `x86_64`, you can build `aivpn-client` with the bundled musl builder
 
 ```bash
 docker build -t aivpn-musl-builder -f Dockerfile.musl-builder .
+$src = (Get-Location).Path
 docker run --rm --mount "type=bind,source=$src,target=/home/rust/src" --workdir /home/rust/src aivpn-musl-builder cargo build --locked --release -p aivpn-client --bin aivpn-client --target x86_64-unknown-linux-musl
 ```
 

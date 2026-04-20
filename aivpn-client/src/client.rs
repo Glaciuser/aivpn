@@ -37,6 +37,9 @@ use crate::local_socks::LocalSocks5Runtime;
 use crate::netns::NetworkNamespace;
 use crate::tunnel::{Tunnel, TunnelConfig};
 
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientMode {
     Tun,
@@ -331,6 +334,8 @@ impl AivpnClient {
         let udp_socket = self.udp_socket.as_ref().unwrap().clone();
         let udp_to_tun_tx_clone = udp_to_tun_tx.clone();
         let shutdown_for_tasks = shutdown.clone();
+        let last_server_packet_at = Arc::new(AtomicU64::new(crypto::current_timestamp_ms()));
+        let last_server_packet_at_udp = last_server_packet_at.clone();
         let udp_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET_SIZE];
             let mut consecutive_errors: u32 = 0;
@@ -344,6 +349,8 @@ impl AivpnClient {
                     Ok(n) => {
                         consecutive_errors = 0;
                         if n > 0 {
+                            last_server_packet_at_udp
+                                .store(crypto::current_timestamp_ms(), Ordering::Relaxed);
                             let _ = udp_to_tun_tx_clone.send(Bytes::copy_from_slice(&buf[..n])).await;
                         }
                     }
@@ -431,6 +438,23 @@ impl AivpnClient {
                         stats_task.abort();
                         break Ok(());
                     }
+
+                    let inactive_for_ms = crypto::current_timestamp_ms()
+                        .saturating_sub(last_server_packet_at.load(Ordering::Relaxed));
+                    if inactive_for_ms >= SERVER_INACTIVITY_TIMEOUT.as_millis() as u64 {
+                        if let Some(runtime) = &self.config.local_socks5_runtime {
+                            runtime.set_ready(false);
+                        }
+                        warn!(
+                            "No inbound packets from server for {}s; reconnecting client session",
+                            SERVER_INACTIVITY_TIMEOUT.as_secs()
+                        );
+                        stats_task.abort();
+                        break Err(Error::Session(format!(
+                            "Server inactivity timeout after {}s without inbound packets",
+                            SERVER_INACTIVITY_TIMEOUT.as_secs()
+                        )));
+                    }
                 }
 
                 // Upload task completed (error or channel closed).
@@ -465,8 +489,10 @@ impl AivpnClient {
         // Stop background tasks before disconnecting.
         tun_task.abort();
         udp_task.abort();
+        stats_task.abort();
         let _ = tun_task.await;
         let _ = udp_task.await;
+        let _ = stats_task.await;
 
         self.disconnect().await;
 
@@ -515,7 +541,7 @@ impl AivpnClient {
 
         let mut enc = MimicryEncryptor { engine, upload_state, bytes_sent };
         let config = UploadConfig {
-            keepalive_interval: Duration::from_secs(15),
+            keepalive_interval: CLIENT_KEEPALIVE_INTERVAL,
             ..Default::default()
         };
         upload_pipeline::run_upload_loop(&mut rx, &udp, &mut enc, &config).await

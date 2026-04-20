@@ -118,6 +118,7 @@
 {
   "connection_key": "aivpn://YOUR_CONNECTION_KEY",
   "mode": "socks5",
+  "log_level": "warn",
   "local_socks5": {
     "host": "127.0.0.1",
     "port": 1080,
@@ -526,6 +527,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 ```bash
 docker build -t aivpn-musl-builder -f Dockerfile.musl-builder .
+$src = (Get-Location).Path
 docker run --rm --mount "type=bind,source=$src,target=/home/rust/src" --workdir /home/rust/src aivpn-musl-builder cargo build --locked --release -p aivpn-client --bin aivpn-client --target x86_64-unknown-linux-musl
 ```
 
