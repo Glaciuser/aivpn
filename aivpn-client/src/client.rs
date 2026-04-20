@@ -27,20 +27,20 @@ use aivpn_common::client_wire::{
 use aivpn_common::protocol::{
     InnerType, ControlPayload, MAX_PACKET_SIZE,
 };
-use aivpn_common::mask::{BootstrapDescriptor, MaskProfile};
+use aivpn_common::mask::MaskProfile;
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::ClientNetworkConfig;
 use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
-use crate::bootstrap_cache;
 use crate::mimicry::MimicryEngine;
+use crate::local_socks::LocalSocks5Runtime;
+use crate::netns::NetworkNamespace;
 use crate::tunnel::{Tunnel, TunnelConfig};
 
-fn packet_mdh_len_for_mask(mask: &MaskProfile) -> usize {
-    mask.header_spec
-        .as_ref()
-        .map(|spec| spec.min_length())
-        .unwrap_or_else(|| mask.header_template.len())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientMode {
+    Tun,
+    Socks5,
 }
 
 /// Client configuration
@@ -51,6 +51,10 @@ pub struct ClientConfig {
     pub preshared_key: Option<[u8; 32]>,
     pub initial_mask: MaskProfile,
     pub tun_config: TunnelConfig,
+    pub mode: ClientMode,
+    pub local_socks5_runtime: Option<Arc<LocalSocks5Runtime>>,
+    /// Server's Ed25519 signing public key for authentication (HIGH-6)
+    pub server_signing_pub: Option<[u8; 32]>,
 }
 
 /// Client state
@@ -87,15 +91,13 @@ pub struct AivpnClient {
     _recv_seq: u32,
     recv_window: RecvWindow,
     transition_recv_window: RecvWindow,
-    recv_mdh_len: usize,
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
+    socks_namespace: Option<Arc<NetworkNamespace>>,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
-    // Recording tracking
-    active_recording_session: Option<[u8; 16]>,
 }
 
 impl AivpnClient {
@@ -103,7 +105,6 @@ impl AivpnClient {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let keypair = KeyPair::generate();
         let tunnel = Tunnel::new(config.tun_config.clone());
-        let recv_mdh_len = packet_mdh_len_for_mask(&config.initial_mask);
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
 
@@ -123,13 +124,12 @@ impl AivpnClient {
             _recv_seq: 0,
             recv_window: RecvWindow::new(),
             transition_recv_window: RecvWindow::new(),
-            recv_mdh_len,
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
+            socks_namespace: None,
             // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
-            active_recording_session: None,
         })
     }
     
@@ -137,20 +137,11 @@ impl AivpnClient {
     pub async fn connect(&mut self) -> Result<()> {
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
-        
-        // Create TUN device first
-        self.tunnel.create()?;
-        
-        // Resolve the server address. Docker/local test setups often use a
-        // hostname rather than a literal IP:port string.
-        let server_addr = tokio::net::lookup_host(&self.config.server_addr)
-            .await
-            .map_err(Error::Io)?
-            .next()
-            .ok_or_else(|| Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("failed to resolve server address: {}", self.config.server_addr),
-            )))?;
+
+        let server_addr: SocketAddr = self.config.server_addr.parse()
+            .map_err(|e: std::net::AddrParseError| Error::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            ))?;
         
         // Create UDP socket with 4MB OS buffers (OPTIMIZATION)
         let domain = if server_addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
@@ -177,10 +168,26 @@ impl AivpnClient {
         self.udp_socket = Some(Arc::new(socket));
 
         self.tunnel.set_server_ip(server_addr.ip().to_string());
-        
-        // Enable full tunnel only after the server UDP path is established.
-        if self.config.tun_config.full_tunnel {
-            self.tunnel.enable_full_tunnel()?;
+
+        match self.config.mode {
+            ClientMode::Tun => {
+                self.tunnel.create()?;
+                // Enable full tunnel only after the server UDP path is established.
+                if self.config.tun_config.full_tunnel {
+                    self.tunnel.enable_full_tunnel()?;
+                }
+            }
+            ClientMode::Socks5 => {
+                let namespace = Arc::new(NetworkNamespace::new()?);
+                namespace.run(|| {
+                    self.tunnel.create()?;
+                    self.tunnel.enable_socks_namespace_routing()
+                })?;
+                self.socks_namespace = Some(namespace.clone());
+                if let Some(runtime) = &self.config.local_socks5_runtime {
+                    runtime.set_namespace(Some(namespace));
+                }
+            }
         }
         
         // Initialize mimicry engine
@@ -188,20 +195,21 @@ impl AivpnClient {
         
         // Derive session keys (Zero-RTT)
         let dh_result = self.keypair.compute_shared(&self.config.server_public_key)?;
-        debug!("Client DH result: {}", hex::encode(&dh_result));
-        debug!("Client eph_pub: {}", hex::encode(self.keypair.public_key_bytes()));
-        debug!("Client PSK: {:?}", self.config.preshared_key.as_ref().map(hex::encode));
         self.session_keys = Some(crypto::derive_session_keys(
             &dh_result,
             self.config.preshared_key.as_ref(),
             &self.keypair.public_key_bytes(),
         ));
-        let keys = self.session_keys.as_ref().unwrap();
-        debug!("Client tag_secret: {}", hex::encode(&keys.tag_secret));
         
         self.state = ClientState::Connected;
         info!("Connected to server at {}", self.config.server_addr);
-        info!("TUN device: {}", self.tunnel.name());
+        match self.config.mode {
+            ClientMode::Tun => info!("TUN device: {}", self.tunnel.name()),
+            ClientMode::Socks5 => info!(
+                "SOCKS5 mode using internal TUN device: {}",
+                self.tunnel.name()
+            ),
+        }
         
         Ok(())
     }
@@ -222,7 +230,20 @@ impl AivpnClient {
 
         let tun_name = self.config.tun_config.tun_name.clone();
         let full_tunnel = self.config.tun_config.full_tunnel;
-        self.tunnel.apply_network_config(network_config)?;
+        match self.config.mode {
+            ClientMode::Tun => {
+                self.tunnel.apply_network_config(network_config)?;
+            }
+            ClientMode::Socks5 => {
+                let namespace = self.socks_namespace.clone().ok_or_else(|| {
+                    Error::Session("SOCKS5 namespace is not initialized".into())
+                })?;
+                namespace.run(|| {
+                    self.tunnel.apply_network_config(network_config)?;
+                    self.tunnel.enable_socks_namespace_routing()
+                })?;
+            }
+        }
         self.config.tun_config = TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
         Ok(())
     }
@@ -241,6 +262,11 @@ impl AivpnClient {
         
         self.state = ClientState::Disconnected;
         self.udp_socket = None;
+        if let Some(runtime) = &self.config.local_socks5_runtime {
+            runtime.set_ready(false);
+            runtime.set_namespace(None);
+        }
+        self.socks_namespace = None;
         
         // Zeroize keys
         self.session_keys = None;
@@ -262,27 +288,6 @@ impl AivpnClient {
         // Create channels for TUN -> upload pipeline and UDP -> main loop
         let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(8192);
         let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Bytes>(8192);
-        let (admin_tx, mut admin_rx) = mpsc::channel::<String>(16);
-        let (control_tx, control_rx) = mpsc::channel::<ControlPayload>(32);
-
-        // Spawn local IPC listener for CLI commands
-        tokio::spawn(async move {
-            match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
-                Ok(socket) => {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        if let Ok((len, _addr)) = socket.recv_from(&mut buf).await {
-                            if let Ok(msg) = String::from_utf8(buf[..len].to_vec()) {
-                                let _ = admin_tx.send(msg).await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to bind local admin UDP socket 127.0.0.1:44301: {}", e);
-                }
-            }
-        });
 
         // Take the TUN reader for the spawned task (no Mutex needed)
         let mut tun_reader = self.tunnel.take_reader()
@@ -395,14 +400,21 @@ impl AivpnClient {
         }));
         self.upload_state = Some(upload_state.clone());
 
+        // Store mdh_len for the receive path (before moving engine into the task).
+        let mdh_len = upload_engine.mask().header_template.len();
+
         let mut upload_task = tokio::spawn(Self::spawn_upload(
             tun_to_udp_rx,
-            control_rx,
             upload_udp,
             upload_engine,
             upload_state,
             upload_bytes_sent,
         ));
+
+        if let Some(runtime) = &self.config.local_socks5_runtime {
+            runtime.set_ready(true);
+            info!("Local SOCKS5 dataplane is ready");
+        }
 
         // Main loop: download + shutdown + upload health
         let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
@@ -410,6 +422,8 @@ impl AivpnClient {
 
         let run_res: Result<()> = loop {
             tokio::select! {
+                biased;
+
                 // Allow fast shutdown.
                 _ = shutdown_tick.tick() => {
                     if shutdown.load(Ordering::SeqCst) {
@@ -428,39 +442,6 @@ impl AivpnClient {
                     };
                 }
 
-                cmd = admin_rx.recv() => {
-                    if let Some(cmd) = cmd {
-                        if let Some(service) = cmd.strip_prefix("record_start:") {
-                            crate::record_cmd::handle_recording_status(true, Some(service));
-                            let payload = ControlPayload::RecordingStart { service: service.to_string() };
-                            if let Err(e) = control_tx.send(payload).await {
-                                error!("Failed to send RecordingStart to upload task: {}", e);
-                            } else {
-                                info!("Sent RecordingStart for {}", service);
-                            }
-                        } else if cmd == "record_stop" {
-                            if let Some(session_id) = self.active_recording_session {
-                                let current_service = crate::record_cmd::read_local_status().and_then(|status| status.service);
-                                crate::record_cmd::mark_recording_stop_requested(current_service.as_deref());
-                                let payload = ControlPayload::RecordingStop { session_id };
-                                if let Err(e) = control_tx.send(payload).await {
-                                    error!("Failed to send RecordingStop to upload task: {}", e);
-                                } else {
-                                    info!("Sent RecordingStop");
-                                }
-                            } else {
-                                warn!("No active recording session to stop");
-                                crate::record_cmd::handle_recording_failed("No active recording session to stop");
-                            }
-                        } else if cmd == "record_status" {
-                            let payload = ControlPayload::RecordingStatusRequest;
-                            if let Err(e) = control_tx.send(payload).await {
-                                error!("Failed to send RecordingStatusRequest to upload task: {}", e);
-                            }
-                        }
-                    }
-                }
-
                 // UDP -> TUN (inbound traffic)
                 res = udp_to_tun_rx.recv() => {
                     let packet = match res {
@@ -468,7 +449,7 @@ impl AivpnClient {
                         None => break Err(Error::Channel("UDP->TUN channel closed".into())),
                     };
 
-                    if let Err(e) = self.receive_and_write_packet(&packet).await {
+                    if let Err(e) = self.receive_and_write_packet_with_mdh(&packet, mdh_len).await {
                         match &e {
                             Error::InvalidPacket(_) => warn!("Receive invalid packet: {}", e),
                             _ => {
@@ -495,7 +476,6 @@ impl AivpnClient {
     /// Spawn the upload task using the shared pipeline.
     async fn spawn_upload(
         mut rx: mpsc::Receiver<Vec<u8>>,
-        mut control_rx: mpsc::Receiver<ControlPayload>,
         udp: Arc<UdpSocket>,
         engine: MimicryEngine,
         upload_state: Arc<Mutex<UploadCryptoState>>,
@@ -519,15 +499,6 @@ impl AivpnClient {
                 Ok(pkt)
             }
 
-            fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
-                let mut state = self.upload_state.lock().expect("upload state poisoned");
-                let bytes = payload.encode()?;
-                let inner = build_inner_packet(InnerType::Control, state.seq, &bytes);
-                state.seq = state.seq.wrapping_add(1);
-                let keys = state.keys.clone();
-                self.engine.build_packet(&inner, &keys, &mut state.counter, None)
-            }
-
             fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
                 let mut state = self.upload_state.lock().expect("upload state poisoned");
                 let keepalive = ControlPayload::Keepalive.encode()?;
@@ -547,18 +518,16 @@ impl AivpnClient {
             keepalive_interval: Duration::from_secs(15),
             ..Default::default()
         };
-        upload_pipeline::run_upload_loop(&mut rx, Some(&mut control_rx), &udp, &mut enc, &config).await
+        upload_pipeline::run_upload_loop(&mut rx, &udp, &mut enc, &config).await
     }
 
     /// Receive packet from server and write to TUN (using pre-computed mdh_len)
-    async fn receive_and_write_packet(&mut self, packet: &[u8]) -> Result<()> {
+    async fn receive_and_write_packet_with_mdh(&mut self, packet: &[u8], mdh_len: usize) -> Result<()> {
         if self.transition_recv_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             self.transition_recv_keys = None;
             self.transition_recv_deadline = None;
             self.transition_recv_window.reset();
         }
-
-        let mdh_len = self.recv_mdh_len;
 
         let keys = self.session_keys.as_ref()
             .ok_or(Error::Session("No session keys".into()))?;
@@ -616,24 +585,28 @@ impl AivpnClient {
                     Err(e) => warn!("Failed to parse mask update: {}", e),
                 }
             }
-            ControlPayload::BootstrapDescriptorUpdate { descriptor_data } => {
-                match rmp_serde::from_slice::<BootstrapDescriptor>(&descriptor_data) {
-                    Ok(descriptor) => {
-                        if let Err(e) = bootstrap_cache::store_verified_descriptor(descriptor) {
-                            warn!("Failed to store bootstrap descriptor: {}", e);
-                        }
-                    }
-                    Err(e) => warn!("Failed to parse bootstrap descriptor update: {}", e),
-                }
-            }
             ControlPayload::KeyRotate { new_eph_pub: _ } => {
                 debug!("Key rotation signal received");
             }
-            ControlPayload::ServerHello { server_eph_pub, signature: _, network_config } => {
+            ControlPayload::ServerHello { server_eph_pub, signature, network_config } => {
                 info!("ServerHello received — completing PFS ratchet");
 
                 if let Some(network_config) = network_config {
                     self.apply_server_network_override(network_config)?;
+                }
+                
+                // Verify Ed25519 signature if server signing key configured (HIGH-6)
+                if let Some(signing_pub) = &self.config.server_signing_pub {
+                    use ed25519_dalek::{VerifyingKey, Verifier, Signature};
+                    let vk = VerifyingKey::from_bytes(signing_pub)
+                        .map_err(|e| Error::Crypto(format!("Invalid server signing key: {}", e)))?;
+                    let mut message = Vec::with_capacity(64);
+                    message.extend_from_slice(&server_eph_pub);
+                    message.extend_from_slice(&self.keypair.public_key_bytes());
+                    let sig = Signature::from_bytes(&signature);
+                    vk.verify(&message, &sig)
+                        .map_err(|_| Error::Crypto("ServerHello signature verification failed".into()))?;
+                    info!("Server authenticated via Ed25519 signature");
                 }
                 
                 // Compute DH2 = client_eph * server_eph for PFS (CRIT-3)
@@ -664,7 +637,6 @@ impl AivpnClient {
                     info!("Outbound ratchet activated — upload switched to new keys");
                 }
                 info!("PFS ratchet complete — forward secrecy established");
-                let _ = self.send_control(&ControlPayload::RecordingStatusRequest).await;
             }
             ControlPayload::Keepalive => {
                 debug!("Keepalive from server");
@@ -675,25 +647,6 @@ impl AivpnClient {
             ControlPayload::Shutdown { reason } => {
                 info!("Server requested shutdown (reason: {})", reason);
                 self.disconnect().await;
-            }
-            ControlPayload::RecordingAck { session_id, status } => {
-                if status == "started" {
-                    self.active_recording_session = Some(session_id);
-                } else if status == "analyzing" {
-                    self.active_recording_session = None;
-                }
-                crate::record_cmd::handle_recording_ack(&session_id, &status);
-            }
-            ControlPayload::RecordingComplete { service, mask_id, confidence } => {
-                self.active_recording_session = None;
-                crate::record_cmd::handle_recording_complete(&service, &mask_id, confidence);
-            }
-            ControlPayload::RecordingFailed { reason } => {
-                self.active_recording_session = None;
-                crate::record_cmd::handle_recording_failed(&reason);
-            }
-            ControlPayload::RecordingStatus { can_record, active_service } => {
-                crate::record_cmd::handle_recording_status(can_record, active_service.as_deref());
             }
             _ => {}
         }
@@ -717,8 +670,6 @@ impl AivpnClient {
         
         // Include eph_pub (obfuscated) in the init packet
         let obf = obfuscate_client_eph_pub(&self.keypair, &self.config.server_public_key);
-        debug!("Client obfuscated eph_pub: {}", hex::encode(&obf));
-        debug!("Client original eph_pub: {}", hex::encode(self.keypair.public_key_bytes()));
         
         let aivpn_packet = mimicry.build_packet(
             &inner_payload,
@@ -782,7 +733,6 @@ impl AivpnClient {
     
     /// Update mask profile
     pub fn update_mask(&mut self, new_mask: MaskProfile) {
-        self.recv_mdh_len = packet_mdh_len_for_mask(&new_mask);
         if let Some(ref mut engine) = self.mimicry_engine {
             info!("Updating mask to {}", new_mask.mask_id);
             engine.update_mask(new_mask);

@@ -13,8 +13,7 @@ use parking_lot::Mutex;
 use chacha20poly1305::aead::OsRng;
 use rand::RngCore;
 use subtle::ConstantTimeEq;
-use tracing::{info, debug};
-use hex;
+use tracing::info;
 
 use aivpn_common::crypto::{
     self, SessionKeys, KeyPair, TAG_SIZE, X25519_PUBLIC_KEY_SIZE, 
@@ -27,14 +26,11 @@ use aivpn_common::error::{Error, Result};
 /// Maximum sessions on 1GB VPS
 pub const MAX_SESSIONS: usize = 500;
 
-/// Session idle timeout (default)
+/// Session idle timeout
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Session hard timeout — 0 means unlimited (Issue #33).
-/// Configurable via `session_timeout_secs` in server.json.
-/// PFS ratchet already handles key rotation, so forced session
-/// expiration is unnecessary and causes reconnect failures.
-pub const HARD_TIMEOUT: Duration = Duration::ZERO;
+/// Session hard timeout
+pub const HARD_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
 /// Tag window size (allow out-of-order packets)
 pub const TAG_WINDOW_SIZE: usize = 256;
@@ -65,8 +61,6 @@ pub struct Session {
     pub last_seen: Instant,
     /// Created timestamp
     pub created_at: Instant,
-    /// Last server-to-client packet timestamp (for downlink recording IAT)
-    pub last_server_send: Instant,
     
     /// Current mask profile
     pub mask: Option<MaskProfile>,
@@ -176,7 +170,6 @@ impl Session {
             counter: 0,
             last_seen: now,
             created_at: now,
-            last_server_send: now,
             mask: None,
             fsm_state: 0,
             fsm_packets: 0,
@@ -408,11 +401,7 @@ pub struct SessionManager {
     /// Server's signing key (Ed25519)
     signing_key: ed25519_dalek::SigningKey,
     /// Default mask profile
-    default_mask: MaskProfile,
-    /// Configurable session hard timeout
-    hard_timeout: Duration,
-    /// Configurable session idle timeout
-    idle_timeout: Duration,
+    _default_mask: MaskProfile,
 }
 
 impl SessionManager {
@@ -421,22 +410,6 @@ impl SessionManager {
         signing_key: ed25519_dalek::SigningKey,
         default_mask: MaskProfile,
     ) -> Self {
-        Self::with_timeouts(server_keys, signing_key, default_mask, None, None)
-    }
-
-    pub fn with_timeouts(
-        server_keys: KeyPair,
-        signing_key: ed25519_dalek::SigningKey,
-        default_mask: MaskProfile,
-        session_timeout_secs: Option<u64>,
-        idle_timeout_secs: Option<u64>,
-    ) -> Self {
-        let hard_timeout = session_timeout_secs
-            .map(|s| Duration::from_secs(s))
-            .unwrap_or(HARD_TIMEOUT);
-        let idle_timeout = idle_timeout_secs
-            .map(|s| Duration::from_secs(s))
-            .unwrap_or(IDLE_TIMEOUT);
         Self {
             sessions: DashMap::new(),
             tag_map: DashMap::new(),
@@ -444,9 +417,7 @@ impl SessionManager {
             next_ip_octet: AtomicU32::new(2),
             server_keys,
             signing_key,
-            default_mask,
-            hard_timeout,
-            idle_timeout,
+            _default_mask: default_mask,
         }
     }
     
@@ -489,15 +460,11 @@ impl SessionManager {
         
         // DH1: server_static * client_eph → initial keys (0-RTT)
         let dh1 = self.server_keys.compute_shared(&eph_pub)?;
-        debug!("Server DH result: {}", hex::encode(&dh1));
-        debug!("Server eph_pub (after deobfuscation): {}", hex::encode(&eph_pub));
-        debug!("Server PSK: {:?}", preshared_key.as_ref().map(hex::encode));
         let initial_keys = crypto::derive_session_keys(
             &dh1,
             preshared_key.as_ref(),
             &eph_pub,
         );
-        debug!("Server tag_secret: {}", hex::encode(&initial_keys.tag_secret));
         
         // --- CRIT-3 + HIGH-6: PFS ratchet preparation ---
         // Generate server ephemeral keypair
@@ -580,12 +547,11 @@ impl SessionManager {
 
     /// Remove all sessions for a given IP except the specified one.
     /// Called after a new handshake is validated to clean up stale sessions.
-    /// Returns list of removed session IDs (for stopping recordings).
     pub fn cleanup_old_sessions_for_ip(
         &self,
         ip: &std::net::IpAddr,
         keep_session_id: &[u8; 16],
-    ) -> Vec<[u8; 16]> {
+    ) {
         let to_remove: Vec<[u8; 16]> = self.sessions.iter()
             .filter_map(|entry| {
                 let session = entry.value().lock();
@@ -597,25 +563,20 @@ impl SessionManager {
             })
             .collect();
 
-        let mut removed = Vec::new();
         for session_id in to_remove {
             info!("Removing stale session for IP {} after successful re-handshake", ip);
-            if self.remove_session(&session_id).is_some() {
-                removed.push(session_id);
-            }
+            self.remove_session(&session_id);
         }
-        removed
     }
 
     /// Remove old sessions for the same VPN IP (same client) except the
     /// specified one. Unlike `cleanup_old_sessions_for_ip`, this does NOT
     /// affect sessions belonging to other clients behind the same NAT.
-    /// Returns list of removed session IDs (for stopping recordings).
     pub fn cleanup_old_sessions_for_vpn_ip(
         &self,
         vpn_ip: &Ipv4Addr,
         keep_session_id: &[u8; 16],
-    ) -> Vec<[u8; 16]> {
+    ) {
         let to_remove: Vec<[u8; 16]> = self.sessions.iter()
             .filter_map(|entry| {
                 let session = entry.value().lock();
@@ -627,14 +588,10 @@ impl SessionManager {
             })
             .collect();
 
-        let mut removed = Vec::new();
         for session_id in to_remove {
             info!("Removing stale session for VPN IP {} after successful re-handshake", vpn_ip);
-            if self.remove_session(&session_id).is_some() {
-                removed.push(session_id);
-            }
+            self.remove_session(&session_id);
         }
-        removed
     }
 
     /// Rollback a session that was created but failed tag validation.
@@ -799,9 +756,8 @@ impl SessionManager {
         }
     }
     
-    /// Remove session and return its ID if it existed.
-    /// The returned session_id can be used to stop active recording.
-    pub fn remove_session(&self, session_id: &[u8; 16]) -> Option<[u8; 16]> {
+    /// Remove session
+    pub fn remove_session(&self, session_id: &[u8; 16]) {
         if let Some((_, session)) = self.sessions.remove(session_id) {
             let sess = session.lock();
             // Remove all tags from tag map (initial + ratcheted)
@@ -816,9 +772,6 @@ impl SessionManager {
             if let Some(vpn_ip) = sess.vpn_ip {
                 self.vpn_ip_map.remove_if(&vpn_ip, |_, sid| sid == session_id);
             }
-            Some(*session_id)
-        } else {
-            None
         }
     }
     
@@ -855,27 +808,17 @@ impl SessionManager {
         }
     }
     
-    /// Cleanup expired sessions and return list of removed session IDs.
-    /// The returned IDs can be used to stop active recordings.
-    pub fn cleanup_expired(&self) -> Vec<[u8; 16]> {
+    /// Cleanup expired sessions
+    pub fn cleanup_expired(&self) {
         let expired: Vec<[u8; 16]> = self.sessions
             .iter()
-            .filter(|e| {
-                let sess = e.value().lock();
-                sess.last_seen.elapsed() > self.idle_timeout
-                    || (self.hard_timeout > Duration::ZERO
-                        && sess.created_at.elapsed() > self.hard_timeout)
-            })
+            .filter(|e| e.value().lock().is_expired() || e.value().lock().is_idle())
             .map(|e| *e.key())
             .collect();
         
-        let mut removed = Vec::new();
         for session_id in expired {
-            if self.remove_session(&session_id).is_some() {
-                removed.push(session_id);
-            }
+            self.remove_session(&session_id);
         }
-        removed
     }
     
     /// Get active session count
@@ -1018,15 +961,8 @@ impl SessionManager {
             time_window,
         );
 
-        // Wrap MaskUpdate in the session's current mask. The switch to `new_mask`
-        // happens only after the packet is successfully delivered.
-        let transport_mask = sess.mask.as_ref().unwrap_or(&self.default_mask);
-        let mdh = if let Some(ref spec) = transport_mask.header_spec {
-            let mut rng = rand::thread_rng();
-            spec.generate(&mut rng)
-        } else {
-            transport_mask.header_template.clone()
-        };
+        // MDH
+        let mdh = vec![0u8; 4];
 
         // Assemble: TAG | MDH | ciphertext
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());

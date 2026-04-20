@@ -23,7 +23,6 @@ services:
       - RUST_BACKTRACE=1
     volumes:
       - ./config:/etc/aivpn
-      - ./masks:/var/lib/aivpn/masks
     logging:
       driver: "json-file"
       options:

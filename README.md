@@ -1,10 +1,20 @@
-# AIVPN
+# AIVPN + SOCKS5
 
 Traditional VPNs are dead. ISPs and state-level firewalls (like GFW) detect WireGuard and OpenVPN in milliseconds just by looking at packet sizes, timing intervals, and handshake patterns. You can encrypt your payload with whatever cipher you want — DPI systems don't care about the content, they block the *shape* of the connection itself.
 
 **AIVPN** is my answer to modern deep packet inspection. We don't just encrypt packets — we disguise them as real application traffic. Your ISP sees a Zoom call or TikTok scrolling, when in reality it's a fully encrypted tunnel.
 
 To validate this in practice, I built my own DPI emulator, reproduced real filtering scenarios, and intentionally blocked traffic across different modes. I then stress-tested the system under heavy load to measure resilience, mask-switching speed, and routing stability. For fast routing, I implemented my patented approach: USPTO (USA) application No. 19/452,440 dated Jan 19, 2026 — *SYSTEM AND METHOD FOR UNSUPERVISED MULTI-TASK ROUTING VIA SIGNAL RECONSTRUCTION RESONANCE*.
+
+## What This Custom Build Adds
+
+This build extends the client for router and sidecar-proxy deployments in addition to the usual TUN-based VPN mode.
+
+- `aivpn-client` supports two runtime modes: `tun` and `socks5`. Use `tun` for the classic VPN client with a system TUN interface and optional `--full-tunnel`, or `socks5` when you need a local proxy instead of owning the main routing table.
+- In `socks5` mode, the local listener stays bound while the VPN tunnel reconnects. Clients receive SOCKS-level errors during recovery instead of losing the port entirely.
+- The `socks5` dataplane can run inside an isolated Linux network namespace, so `sing-box` or `v2raya` can keep rule-based routing control while AIVPN serves as the encrypted outbound on `127.0.0.1:1080`.
+- OpenWrt-oriented builds are supported. You can build a static `x86_64-unknown-linux-musl` client with `Dockerfile.musl-builder`, which is useful for OpenWrt `x86_64` routers and similar minimal Linux systems.
+- Runtime mode selection and local SOCKS5 settings are available both via CLI flags and JSON config, so the same binary fits both classic VPN and router-proxy setups.
 
 ## Supported Platforms
 
@@ -26,17 +36,18 @@ To validate this in practice, I built my own DPI emulator, reproduced real filte
 
 No need to compile — download and run:
 
-| Platform | File | Size | Notes |
-|----------|------|------|-------|
-| **macOS** | [aivpn-macos.dmg](releases/aivpn-macos.dmg) | ~1.8 MB | Menu bar app with RU/EN interface |
-| **Linux** | [aivpn-client-linux-x86_64](releases/aivpn-client-linux-x86_64) | ~4.0 MB | Native x86_64 GNU/Linux CLI binary |
-| **Linux ARMv7** | [aivpn-client-linux-armv7-musleabihf](releases/aivpn-client-linux-armv7-musleabihf) | ~4-5 MB | Static musl client binary for ARMv7 servers and SBCs |
-| **Entware / MIPSel** | [aivpn-client-linux-mipsel-musl](releases/aivpn-client-linux-mipsel-musl) | ~4-5 MB | Static musl client binary for Entware-capable routers |
-| **Windows** | [aivpn-windows-package.zip](releases/aivpn-windows-package.zip) | ~7 MB | Includes `aivpn-client.exe` + `wintun.dll` |
-| **Android** | [aivpn-client.apk](releases/aivpn-client.apk) | ~6.5 MB | Install and paste your connection key |
-| **Linux Server** | [aivpn-server-linux-x86_64](releases/aivpn-server-linux-x86_64) | ~4.0 MB | Prebuilt x86_64 GNU/Linux server binary for VPS or fast Docker deploy |
-| **Linux Server ARMv7** | [aivpn-server-linux-armv7-musleabihf](releases/aivpn-server-linux-armv7-musleabihf) | ~4-5 MB | Static musl server binary for ARMv7 Linux hosts |
-| **Linux Server MIPSel** | [aivpn-server-linux-mipsel-musl](releases/aivpn-server-linux-mipsel-musl) | ~4-5 MB | Static musl server binary for lightweight MIPSel/Entware systems |
+| Platform                | File | Size | Notes                                                                 |
+|-------------------------|------|------|-----------------------------------------------------------------------|
+| **macOS**               | [aivpn-macos.dmg](releases/aivpn-macos.dmg) | ~1.8 MB | Menu bar app with RU/EN interface                                     |
+| **Linux**               | [aivpn-client-linux-x86_64](releases/aivpn-client-linux-x86_64) | ~4.0 MB | Native x86_64 GNU/Linux CLI binary                                    |
+| **OpenWrt**             | [aivpn-client-openwrt-musl](releases/aivpn-client-openwrt-musl) | ~4.0 MB | Linux OpenWrt CLI binary     |
+| **Linux ARMv7**         | [aivpn-client-linux-armv7-musleabihf](releases/aivpn-client-linux-armv7-musleabihf) | ~4-5 MB | Static musl client binary for ARMv7 servers and SBCs                  |
+| **Entware / MIPSel**    | [aivpn-client-linux-mipsel-musl](releases/aivpn-client-linux-mipsel-musl) | ~4-5 MB | Static musl client binary for Entware-capable routers                 |
+| **Windows**             | [aivpn-windows-package.zip](releases/aivpn-windows-package.zip) | ~7 MB | Includes `aivpn-client.exe` + `wintun.dll`                            |
+| **Android**             | [aivpn-client.apk](releases/aivpn-client.apk) | ~6.5 MB | Install and paste your connection key                                 |
+| **Linux Server**        | [aivpn-server-linux-x86_64](releases/aivpn-server-linux-x86_64) | ~4.0 MB | Prebuilt x86_64 GNU/Linux server binary for VPS or fast Docker deploy |
+| **Linux Server ARMv7**  | [aivpn-server-linux-armv7-musleabihf](releases/aivpn-server-linux-armv7-musleabihf) | ~4-5 MB | Static musl server binary for ARMv7 Linux hosts                       |
+| **Linux Server MIPSel** | [aivpn-server-linux-mipsel-musl](releases/aivpn-server-linux-mipsel-musl) | ~4-5 MB | Static musl server binary for lightweight MIPSel/Entware systems      |
 
 
 ### Quick Start (macOS)
@@ -73,6 +84,46 @@ No need to compile — download and run:
     ```
 4. Because these musl builds are statically linked, no Rust toolchain or extra shared libraries are required on the router.
 
+### Client Modes
+
+`aivpn-client` supports two runtime modes:
+
+- `tun` is the default VPN client mode. It creates the system TUN interface and can optionally enable `--full-tunnel`.
+- `socks5` starts a local SOCKS5 listener and keeps it bound for the whole process lifetime. While the VPN tunnel is reconnecting, the listener stays up and returns SOCKS-level errors instead of dropping the port. Its VPN dataplane runs in an isolated Linux network namespace, so the main routing table can stay under `sing-box` control.
+
+CLI examples:
+
+```sh
+# Regular VPN client
+./aivpn-client -k "your_connection_key_here" --mode tun --full-tunnel
+
+# Local SOCKS5 proxy on 127.0.0.1:1080
+./aivpn-client -k "your_connection_key_here" --mode socks5 --local-socks5-host 127.0.0.1 --local-socks5-port 1080
+
+# Local SOCKS5 with custom concurrency limits
+./aivpn-client -k "your_connection_key_here" --mode socks5 --local-socks5-host 127.0.0.1 --local-socks5-port 1080 --local-socks5-max-clients 256 --local-socks5-max-concurrent-dials 128
+
+# Using a JSON config file
+./aivpn-client --config /etc/aivpn/client.json
+```
+
+In this setup, `sing-box` accepts traffic as usual and decides per rule whether to use `direct` or the local `socks5` outbound that points to `127.0.0.1:1080`.
+
+Example `client.json` for local SOCKS5 mode:
+
+```json
+{
+  "connection_key": "aivpn://YOUR_CONNECTION_KEY",
+  "mode": "socks5",
+  "local_socks5": {
+    "host": "127.0.0.1",
+    "port": 1080,
+    "max_clients": 256,
+    "max_concurrent_dials": 128
+  }
+}
+```
+
 ### Quick Start (Android)
 1. Download and install `aivpn-client.apk`
 2. Paste your connection key (`aivpn://...`) into the app
@@ -102,9 +153,13 @@ If `keystore.properties` is absent, the script falls back to an unsigned release
 
 ## ❤️ Support the Project
 
-If you find this project helpful, you can support its development with a donation via Tribute:
+If you find this project helpful, you can support its development with a donation via Tribute to original author:
 
 👉 https://t.me/tribute/app?startapp=dzX1
+
+If you'd like to support my work on this custom build or just buy me a coffee, you can do it here:
+
+👉 https://pay.cloudtips.ru/p/c22078e0
 
 Every donation helps keep AIVPN evolving. Thank you! 🙌
 
@@ -184,9 +239,10 @@ else
     exit 1
 fi
 
-# Optional: pre-create config/server.json or config/server.key here.
-# If they are missing, the container now bootstraps both automatically.
+# Generate server key
 mkdir -p config
+openssl rand 32 > config/server.key
+chmod 600 config/server.key
 
 # Enable NAT (required for internet access from VPN)
 DEFAULT_IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
@@ -217,7 +273,6 @@ sudo firewall-cmd --reload
 ```
 
 > The container runs with `network_mode: "host"` and mounts `./config` → `/etc/aivpn` inside the container.
-> On first start it auto-creates `server.json` from the bundled example and generates `server.key` if either file is missing.
 
 #### Option B: Bare metal
 
@@ -340,91 +395,6 @@ aivpn-server \
     --clients-db /etc/aivpn/clients.json
 ```
 
-### 3.2 Recording Custom Masks
-
-AIVPN supports automatic traffic recording from real applications to create new mimicry profiles. This allows adapting the system to specific services that aren't blocked in your network.
-
-#### How Recording Works
-
-The recording system works through an **authenticated client connection**:
-
-1. **Create admin client**: Generate a special admin key on the server
-2. **Connect client**: Start the AIVPN client with the admin connection key
-3. **Start recording**: Send `record start <service>` command through the VPN tunnel
-4. **Use the service**: The system captures packet metadata (sizes, intervals, headers)
-5. **Stop recording**: Send `record stop` to trigger mask generation and self-testing
-
-The server-side pipeline:
-- **Record**: Intercepts UDP packets from the VPN session
-- **Analyze**: Builds size histogram, computes IAT periods, infers FSM
-- **Generate**: Creates a full `MaskProfile` with `HeaderSpec`
-- **Self-test**: Validates statistical reproduction
-- **Store**: Saves to mask storage and registers in catalog
-
-#### Step-by-Step Guide
-
-**1. Create an admin client on the server:**
-
-```bash
-# Docker
-docker compose exec aivpn-server aivpn-server \
-    --add-client "recording-admin" \
-    --key-file /etc/aivpn/server.key \
-    --clients-db /etc/aivpn/clients.json \
-    --server-ip YOUR_SERVER_IP:443
-
-# Bare metal
-aivpn-server \
-    --add-client "recording-admin" \
-    --key-file /etc/aivpn/server.key \
-    --clients-db /etc/aivpn/clients.json \
-    --server-ip YOUR_SERVER_IP:443
-```
-
-Save the output connection key (starts with `aivpn://`).
-
-**2. Connect the client with admin key:**
-
-```bash
-sudo ./target/release/aivpn-client -k "aivpn://..."
-```
-
-**3. Start recording for a service:**
-
-```bash
-# Send record start command through the VPN tunnel
-aivpn record start --service zoom
-```
-
-**4. Use the service normally** for 30-60 seconds to capture diverse traffic patterns.
-
-**5. Stop recording:**
-
-```bash
-aivpn record stop
-```
-
-The server will analyze the captured packets and generate a new mask. You'll see output like:
-
-```
-✅ Mask generated and tested!
-
-   Mask ID:     zoom_custom_abc123
-   Service:     zoom
-   Confidence:  0.87
-
-   Broadcasting to all clients...
-```
-
-#### Requirements for Good Masks
-
-- **At least 500 packets** for statistical significance
-- **Minimum 60 seconds** of recording (system requirement)
-- **Diverse traffic**: different operation types in the service
-- **Stable connection**: no disconnects or retransmissions
-
-Each mask is a separate JSON file named `{mask_id}.json`.
-
 ### 4. Client
 
 #### Connection Key (recommended)
@@ -538,33 +508,91 @@ For static musl cross-builds without installing a local cross toolchain, use Doc
 ./build-musl-release.sh server mipsel-unknown-linux-musl
 ```
 
+For OpenWrt `x86_64`, you can build `aivpn-client` with the bundled musl builder image:
+
+```bash
+docker build -t aivpn-musl-builder -f Dockerfile.musl-builder .
+docker run --rm --mount "type=bind,source=$src,target=/home/rust/src" --workdir /home/rust/src aivpn-musl-builder cargo build --locked --release -p aivpn-client --bin aivpn-client --target x86_64-unknown-linux-musl
+```
+
 These artifacts are intended for ARM Linux servers/SBCs and Entware-capable MIPSel routers.
 
 For Entware routers, the usual flow is: build or download the musl artifact, copy it into `/opt/bin`, `chmod +x`, and run it directly from the router shell.
 
 ## Project Structure
 
+Key directories and files:
+
 ```
 aivpn/
 ├── aivpn-common/src/
-│   ├── crypto.rs        # X25519, ChaCha20-Poly1305, BLAKE3
-│   ├── mask.rs          # Mimicry profiles (WebRTC, QUIC, DNS)
-│   └── protocol.rs      # Packet format, inner types
+│   ├── lib.rs                 # Shared exports for client/server/mobile crates
+│   ├── crypto.rs              # X25519, ChaCha20-Poly1305, BLAKE3, session keys
+│   ├── client_wire.rs         # Packet framing, replay window, client wire helpers
+│   ├── protocol.rs            # Inner packet types and control payloads
+│   ├── network_config.rs      # VPN subnet, MTU, client/server network config helpers
+│   ├── mask.rs                # Mimicry profiles (WebRTC, QUIC, DNS)
+│   ├── error.rs               # Shared error types
+│   └── upload_pipeline.rs     # Shared client upload loop for CLI and Android
+├── aivpn-common/tests/        # Common battle/integration tests
 ├── aivpn-client/src/
-│   ├── client.rs        # Core client logic
-│   ├── tunnel.rs        # TUN interface (Linux / macOS / Windows)
-│   └── mimicry.rs       # Traffic shaping engine
+│   ├── main.rs                # CLI args, mode selection, JSON config, reconnect loop
+│   ├── lib.rs                 # Client crate exports
+│   ├── client.rs              # Core client session and transport logic
+│   ├── tunnel.rs              # Cross-platform TUN interface (Linux/macOS/Windows)
+│   ├── mimicry.rs             # Traffic shaping engine
+│   ├── local_socks.rs         # Embedded local SOCKS5 server/runtime
+│   └── netns.rs               # Linux network namespace isolation for SOCKS5 mode
 ├── aivpn-server/src/
-│   ├── gateway.rs       # UDP gateway, MaskCatalog, resonance loop
-│   ├── neural.rs        # Baked Mask Encoder, AnomalyDetector
-│   ├── nat.rs           # NAT forwarder (iptables)
-│   ├── client_db.rs     # Client database (PSK, static IP, stats)
-│   ├── key_rotation.rs  # Session key rotation
-│   └── metrics.rs       # Prometheus monitoring
-├── aivpn-android/       # Android client (Kotlin)
-├── Dockerfile
-├── docker-compose.yml
-└── build.sh
+│   ├── main.rs                # Server binary, config loading, client-management CLI
+│   ├── lib.rs                 # Server crate exports
+│   ├── server.rs              # ServerArgs and top-level runner
+│   ├── gateway.rs             # UDP gateway, handshake, packet dispatch
+│   ├── session.rs             # Session tracking, anti-replay, active state
+│   ├── client_db.rs           # Persistent clients DB, PSK/IP allocation, stats
+│   ├── nat.rs                 # NAT/TUN forwarding helpers
+│   ├── neural.rs              # Neural resonance and anomaly detection
+│   ├── key_rotation.rs        # Session key rotation
+│   ├── passive_distribution.rs # Passive mask delivery channels
+│   └── metrics.rs             # Prometheus monitoring
+├── aivpn-server/tests/        # Server battle/integration tests
+├── aivpn-android/
+│   ├── app/src/               # Kotlin UI, VpnService, Android app resources
+│   └── build-rust-android.sh  # Android Rust build helper
+├── aivpn-android-core/src/
+│   ├── lib.rs                 # JNI entry points used by the Android app
+│   └── android_tunnel.rs      # Android tunnel runtime around VpnService FD
+├── aivpn-macos/
+│   ├── AivpnApp.swift         # macOS menu bar app entry point
+│   ├── ContentView.swift      # SwiftUI interface
+│   ├── VPNManager.swift       # macOS client process/control glue
+│   └── aivpn-helper/          # Privileged helper for tunnel setup
+├── aivpn-windows/src/
+│   ├── main.rs                # Native Windows GUI bootstrap
+│   ├── ui.rs                  # egui screens and forms
+│   ├── tray.rs                # System tray integration
+│   ├── vpn_manager.rs         # Launches/manages aivpn-client.exe
+│   ├── key_storage.rs         # Saved connection keys
+│   └── localization.rs        # RU/EN localization strings
+├── config/
+│   ├── client.json.example    # Example tun/socks5 client config
+│   └── server.json.example    # Example server listen/subnet config
+├── monitoring/
+│   └── prometheus.yml         # Example Prometheus scrape config
+├── .github/workflows/
+│   └── server-release-asset.yml # GitHub Releases build/upload automation
+├── releases/                  # Prebuilt binaries and release notes
+├── Dockerfile                 # Source-build server image
+├── Dockerfile.client          # Client container image
+├── Dockerfile.prebuilt        # Fast deploy image from prebuilt server binary
+├── Dockerfile.musl-builder    # Musl/OpenWrt build environment
+├── docker-compose.yml         # Main deployment stack
+├── docker-compose.test.yml    # Test compose stack
+├── build.sh                   # Generic workspace build helper
+├── build-server-release.sh    # Build Linux server release artifact
+├── build-musl-release.sh      # ARM/MIPSel musl release builds
+├── build-windows-gui.sh       # Build/package the Windows GUI app
+└── deploy-server-release.sh   # One-command VPS deploy from published release
 ```
 
 ## Contributing

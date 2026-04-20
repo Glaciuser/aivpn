@@ -1,10 +1,20 @@
-# AIVPN
+# AIVPN + SOCKS5
 
 Обычные VPN давно мертвы. Провайдеры и GFW (китайский файрвол) палят WireGuard и OpenVPN за доли секунды по размерам пакетов, интервалам и хэндшейкам. Можете шифровать трафик хоть тройным AES — DPI-системам плевать на содержимое, они блокируют саму *форму* соединения.
 
 **AIVPN** — это мой ответ современным системам глубокого анализа трафика (DPI). Мы не просто шифруем пакеты, мы "натягиваем" на них маску реальных приложений. Для провайдера вы сидите в Zoom-колле или листаете TikTok, а на деле — это зашифрованный туннель.
 
 Чтобы проверить это на практике, я разработал собственный эмулятор DPI, воспроизводил реальные сценарии фильтрации и целенаправленно блокировал трафик в разных режимах. Затем прогонял систему под высокой нагрузкой, чтобы оценить устойчивость, скорость переключения масок и стабильность маршрутизации. Для быстрого роутинга внедрено мое запатентованное решение: заявка USPTO (USA) № 19/452,440 от Jan 19, 2026 — *SYSTEM AND METHOD FOR UNSUPERVISED MULTI-TASK ROUTING VIA SIGNAL RECONSTRUCTION RESONANCE*.
+
+## Чем отличается наша доработка
+
+Эта сборка расширяет клиент под роутерные и sidecar-proxy сценарии, а не только под обычный VPN через TUN.
+
+- `aivpn-client` поддерживает два режима работы: `tun` и `socks5`. `tun` нужен для классического VPN-клиента с системным TUN-интерфейсом и опциональным `--full-tunnel`, а `socks5` — когда нужен локальный прокси без перехвата основной таблицы маршрутизации.
+- В режиме `socks5` локальный listener остаётся поднятым во время переподключения VPN-туннеля. Вместо пропажи порта клиенты получают SOCKS-ошибки уровня протокола.
+- `socks5` dataplane можно держать в изолированном Linux network namespace, поэтому `sing-box` или `v2raya` продолжают управлять rule-based routing, а AIVPN работает как зашифрованный outbound на `127.0.0.1:1080`.
+- Поддерживаются и OpenWrt-ориентированные сборки. Статический клиент `x86_64-unknown-linux-musl` можно собрать через `Dockerfile.musl-builder`, что удобно для роутеров OpenWrt `x86_64` и других минималистичных Linux-систем.
+- Выбор режима работы и параметров локального SOCKS5 доступен и через CLI-флаги, и через JSON-конфиг, поэтому один и тот же бинарник подходит и для классического VPN, и для router-proxy сценариев.
 
 
 ## Поддерживаемые платформы
@@ -31,6 +41,7 @@
 |-----------|------|--------|------------|
 | **macOS** | [aivpn-macos.dmg](releases/aivpn-macos.dmg) | ~1.8 МБ | Приложение в menu bar с интерфейсом RU/EN |
 | **Linux** | [aivpn-client-linux-x86_64](releases/aivpn-client-linux-x86_64) | ~4.0 МБ | Нативный x86_64 GNU/Linux CLI бинарник |
+| **OpenWrt**             | [aivpn-client-openwrt-musl](releases/aivpn-client-openwrt-musl) | ~4.0 MB | Linux OpenWrt CLI бинарник     |
 | **Linux ARMv7** | [aivpn-client-linux-armv7-musleabihf](releases/aivpn-client-linux-armv7-musleabihf) | ~4-5 МБ | Статический musl CLI-клиент для ARMv7 серверов и SBC |
 | **Entware / MIPSel** | [aivpn-client-linux-mipsel-musl](releases/aivpn-client-linux-mipsel-musl) | ~4-5 МБ | Статический musl CLI-клиент для роутеров с Entware |
 | **Windows** | [aivpn-windows-package.zip](releases/aivpn-windows-package.zip) | ~7 МБ | Внутри `aivpn-client.exe` и `wintun.dll` |
@@ -74,16 +85,82 @@
     ```
 4. Эти musl-сборки статически слинкованы, поэтому на роутере не нужен Rust toolchain и дополнительные shared libraries.
 
+### Режимы клиента
+
+`aivpn-client` поддерживает два режима запуска:
+
+- `tun` — режим VPN-клиента по умолчанию. Он создаёт системный TUN-интерфейс и при необходимости может включать `--full-tunnel`.
+- `socks5` — поднимает локальный SOCKS5 listener и держит его привязанным в течение всей жизни процесса. Пока VPN-туннель переподключается, listener остаётся доступным и возвращает SOCKS-ошибки вместо того, чтобы ронять порт. Его VPN dataplane работает в изолированном Linux network namespace, поэтому основная таблица маршрутизации может оставаться под управлением `sing-box`.
+
+Примеры CLI:
+
+```sh
+# Обычный VPN-клиент
+./aivpn-client -k "ваш_ключ_подключения" --mode tun --full-tunnel
+
+# Локальный SOCKS5-прокси на 127.0.0.1:1080
+./aivpn-client -k "ваш_ключ_подключения" --mode socks5 --local-socks5-host 127.0.0.1 --local-socks5-port 1080
+
+# Локальный SOCKS5 с кастомными лимитами параллелизма
+./aivpn-client -k "ваш_ключ_подключения" --mode socks5 --local-socks5-host 127.0.0.1 --local-socks5-port 1080 --local-socks5-max-clients 256 --local-socks5-max-concurrent-dials 128
+
+# Использование JSON-конфига
+./aivpn-client --config /etc/aivpn/client.json
+```
+
+В этой схеме `sing-box` принимает трафик как обычно и по своим правилам решает, отправлять его через `direct` или через локальный `socks5` outbound, указывающий на `127.0.0.1:1080`.
+
+Пример `client.json` для локального SOCKS5-режима:
+
+```json
+{
+  "connection_key": "aivpn://YOUR_CONNECTION_KEY",
+  "mode": "socks5",
+  "local_socks5": {
+    "host": "127.0.0.1",
+    "port": 1080,
+    "max_clients": 256,
+    "max_concurrent_dials": 128
+  }
+}
+```
+
 ### Быстрый старт (Android)
 1. Скачайте и установите `aivpn-client.apk`
 2. Вставьте ключ подключения (`aivpn://...`) в приложение
 3. Нажмите **Подключить**
 
+### Подпись Android release
+
+Для production-подписанного Android APK создайте `aivpn-android/keystore.properties`:
+
+```properties
+storeFile=/absolute/path/to/aivpn-release.jks
+storePassword=your-store-password
+keyAlias=aivpn
+keyPassword=your-key-password
+```
+
+Затем соберите с Java 21:
+
+```bash
+cd aivpn-android
+export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
+export PATH="$JAVA_HOME/bin:$PATH"
+./build-rust-android.sh release
+```
+
+Если `keystore.properties` отсутствует, скрипт использует fallback: сначала соберёт неподписанный release APK, а затем подпишет его debug-keystore только как локально устанавливаемый вариант.
+
 ## ❤️ Поддержать проект
 
-Если проект оказался полезным, вы можете поддержать его развитие донейшеном через Tribute:
+Если проект оказался полезным, вы можете поддержать его развитие донейшеном через Tribute основному автору:
 
 👉 https://t.me/tribute/app?startapp=dzX1
+
+Поддержать или просто закинуть на кофе за мою доработку можно тут:
+
+👉 https://pay.cloudtips.ru/p/c22078e0
 
 Любая поддержка помогает развивать AIVPN дальше. Спасибо! 🙌
 
@@ -330,91 +407,6 @@ aivpn-server \
     --clients-db /etc/aivpn/clients.json
 ```
 
-### 3.2 Запись собственных масок
-
-AIVPN поддерживает автоматическую запись трафика реальных приложений для создания новых профилей мимикрии. Это позволяет адаптировать систему под конкретные сервисы, которые не блокируются в вашей сети.
-
-#### Как работает запись
-
-Система записи работает через **аутентифицированное клиентское подключение**:
-
-1. **Создать admin-клиента**: Сгенерировать специальный админский ключ на сервере
-2. **Подключить клиент**: Запустить AIVPN-клиент с админским ключом подключения
-3. **Начать запись**: Отправить команду `record start <service>` через VPN-туннель
-4. **Использовать сервис**: Система захватывает метаданные пакетов (размеры, интервалы, заголовки)
-5. **Остановить запись**: Отправить `record stop` для генерации маски и самотестирования
-
-Серверный конвейер:
-- **Запись**: Перехват UDP-пакетов из VPN-сессии
-- **Анализ**: Построение гистограммы размеров, вычисление периодов IAT, вывод FSM
-- **Генерация**: Создание полного `MaskProfile` с `HeaderSpec`
-- **Самотестирование**: Проверка воспроизведения статистических свойств
-- **Сохранение**: Сохранение в хранилище и регистрация в каталоге
-
-#### Пошаговая инструкция
-
-**1. Создать admin-клиента на сервере:**
-
-```bash
-# Docker
-docker compose exec aivpn-server aivpn-server \
-    --add-client "recording-admin" \
-    --key-file /etc/aivpn/server.key \
-    --clients-db /etc/aivpn/clients.json \
-    --server-ip ВАШ_IP_СЕРВЕРА:443
-
-# На голом железе
-aivpn-server \
-    --add-client "recording-admin" \
-    --key-file /etc/aivpn/server.key \
-    --clients-db /etc/aivpn/clients.json \
-    --server-ip ВАШ_IP_СЕРВЕРА:443
-```
-
-Сохраните выходной ключ подключения (начинается с `aivpn://`).
-
-**2. Подключить клиент с админским ключом:**
-
-```bash
-sudo ./target/release/aivpn-client -k "aivpn://..."
-```
-
-**3. Начать запись для сервиса:**
-
-```bash
-# Отправить команду начала записи через VPN-туннель
-aivpn record start --service zoom
-```
-
-**4. Использовать сервис нормально** в течение нескольких минтут для захвата разнообразных паттернов трафика.
-
-**5. Остановить запись:**
-
-```bash
-aivpn record stop
-```
-
-Сервер проанализирует захваченные пакеты и сгенерирует новую маску. Вы увидите вывод:
-
-```
-✅ Mask generated and tested!
-
-   Mask ID:     zoom_custom_abc123
-   Service:     zoom
-   Confidence:  0.87
-
-   Broadcasting to all clients...
-```
-
-#### Требования к хорошим маскам
-
-- **Минимум 500 пакетов** для статистической значимости
-- **Минимум 60 секунд** записи (требование системы) лучше больше
-- **Разнообразный трафик**: разные типы операций в сервисе
-- **Стабильное соединение**: без разрывов и ретрансмиссий
-
-Каждая маска — отдельный JSON-файл с именем `{mask_id}.json`.
-
 ### 4. Клиент
 
 #### Ключ подключения (рекомендуется)
@@ -528,33 +520,91 @@ cargo build --release --target x86_64-pc-windows-msvc
 ./build-musl-release.sh server mipsel-unknown-linux-musl
 ```
 
+Для OpenWrt `x86_64` можно собрать `aivpn-client` через встроенный musl builder-образ:
+
+```bash
+docker build -t aivpn-musl-builder -f Dockerfile.musl-builder .
+docker run --rm --mount "type=bind,source=$src,target=/home/rust/src" --workdir /home/rust/src aivpn-musl-builder cargo build --locked --release -p aivpn-client --bin aivpn-client --target x86_64-unknown-linux-musl
+```
+
 Эти артефакты рассчитаны на ARM Linux-серверы/SBC и MIPSel-роутеры с Entware.
 
 Для Entware-роутеров обычный поток такой: собрать или скачать musl-артефакт, скопировать его в `/opt/bin`, выдать `chmod +x` и запускать прямо из shell роутера.
 
 ## Структура проекта
 
+Ключевые директории и файлы:
+
 ```
 aivpn/
 ├── aivpn-common/src/
-│   ├── crypto.rs        # X25519, ChaCha20-Poly1305, BLAKE3
-│   ├── mask.rs          # Профили мимикрии (WebRTC, QUIC, DNS)
-│   └── protocol.rs      # Формат пакетов, inner types
+│   ├── lib.rs                 # Общие экспорты для client/server/mobile crates
+│   ├── crypto.rs              # X25519, ChaCha20-Poly1305, BLAKE3, сессионные ключи
+│   ├── client_wire.rs         # Фрейминг пакетов, replay window, client wire helpers
+│   ├── protocol.rs            # Типы внутренних пакетов и control payloads
+│   ├── network_config.rs      # VPN-подсеть, MTU и сетевые helper-ы клиента/сервера
+│   ├── mask.rs                # Профили мимикрии (WebRTC, QUIC, DNS)
+│   ├── error.rs               # Общие типы ошибок
+│   └── upload_pipeline.rs     # Общий upload loop для CLI и Android
+├── aivpn-common/tests/        # Общие battle/integration тесты
 ├── aivpn-client/src/
-│   ├── client.rs        # Основная логика клиента
-│   ├── tunnel.rs        # TUN-интерфейс (Linux / macOS / Windows)
-│   └── mimicry.rs       # Движок шейпинга трафика
+│   ├── main.rs                # CLI-аргументы, выбор режима, JSON-конфиг, reconnect loop
+│   ├── lib.rs                 # Экспорты crate клиента
+│   ├── client.rs              # Основная логика клиентской сессии и транспорта
+│   ├── tunnel.rs              # Кроссплатформенный TUN-интерфейс (Linux/macOS/Windows)
+│   ├── mimicry.rs             # Движок шейпинга трафика
+│   ├── local_socks.rs         # Встроенный локальный SOCKS5 server/runtime
+│   └── netns.rs               # Linux network namespace isolation для SOCKS5-режима
 ├── aivpn-server/src/
-│   ├── gateway.rs       # UDP-шлюз, MaskCatalog, resonance loop
-│   ├── neural.rs        # Baked Mask Encoder, AnomalyDetector
-│   ├── nat.rs           # NAT-форвардер (iptables)
-│   ├── client_db.rs     # База клиентов (PSK, статический IP, статистика)
-│   ├── key_rotation.rs  # Ротация сессионных ключей
-│   └── metrics.rs       # Prometheus-мониторинг
-├── aivpn-android/       # Android-клиент (Kotlin)
-├── Dockerfile
-├── docker-compose.yml
-└── build.sh
+│   ├── main.rs                # Бинарник сервера, загрузка конфига, CLI управления клиентами
+│   ├── lib.rs                 # Экспорты crate сервера
+│   ├── server.rs              # ServerArgs и верхнеуровневый runner
+│   ├── gateway.rs             # UDP-шлюз, handshake, диспетчеризация пакетов
+│   ├── session.rs             # Учёт сессий, anti-replay, активное состояние
+│   ├── client_db.rs           # Постоянная база клиентов, выдача PSK/IP, статистика
+│   ├── nat.rs                 # Helper-ы для NAT/TUN форвардинга
+│   ├── neural.rs              # Neural resonance и детекция аномалий
+│   ├── key_rotation.rs        # Ротация сессионных ключей
+│   ├── passive_distribution.rs # Каналы пассивной доставки масок
+│   └── metrics.rs             # Prometheus-мониторинг
+├── aivpn-server/tests/        # Серверные battle/integration тесты
+├── aivpn-android/
+│   ├── app/src/               # Kotlin UI, VpnService и ресурсы Android-приложения
+│   └── build-rust-android.sh  # Helper для сборки Rust-части Android
+├── aivpn-android-core/src/
+│   ├── lib.rs                 # JNI entry points для Android-приложения
+│   └── android_tunnel.rs      # Android tunnel runtime вокруг VpnService FD
+├── aivpn-macos/
+│   ├── AivpnApp.swift         # Точка входа menu bar приложения macOS
+│   ├── ContentView.swift      # SwiftUI-интерфейс
+│   ├── VPNManager.swift       # Склейка управления клиентским процессом на macOS
+│   └── aivpn-helper/          # Привилегированный helper для настройки туннеля
+├── aivpn-windows/src/
+│   ├── main.rs                # Bootstrap нативного Windows GUI
+│   ├── ui.rs                  # Экран и формы на egui
+│   ├── tray.rs                # Интеграция с системным треем
+│   ├── vpn_manager.rs         # Запуск и управление aivpn-client.exe
+│   ├── key_storage.rs         # Сохранённые ключи подключения
+│   └── localization.rs        # RU/EN локализация
+├── config/
+│   ├── client.json.example    # Пример client-конфига для tun/socks5
+│   └── server.json.example    # Пример server-конфига listen/subnet
+├── monitoring/
+│   └── prometheus.yml         # Пример Prometheus scrape-конфига
+├── .github/workflows/
+│   └── server-release-asset.yml # Автосборка и загрузка артефактов в GitHub Releases
+├── releases/                  # Готовые бинарники и release notes
+├── Dockerfile                 # Docker-образ сервера из исходников
+├── Dockerfile.client          # Docker-образ клиента
+├── Dockerfile.prebuilt        # Быстрый deploy-образ из готового server binary
+├── Dockerfile.musl-builder    # Окружение для musl/OpenWrt сборок
+├── docker-compose.yml         # Основной deployment stack
+├── docker-compose.test.yml    # Compose-стек для тестов
+├── build.sh                   # Общий helper для сборки workspace
+├── build-server-release.sh    # Сборка Linux server release-артефакта
+├── build-musl-release.sh      # musl release-сборки для ARM/MIPSel
+├── build-windows-gui.sh       # Сборка и упаковка Windows GUI
+└── deploy-server-release.sh   # Однокомандный деплой VPS из опубликованного релиза
 ```
 
 ## Разработка и контрибы

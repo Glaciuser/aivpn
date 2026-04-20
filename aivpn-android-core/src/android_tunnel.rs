@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use aivpn_common::client_wire::{
-    build_inner_packet, build_random_mdh_packet, decode_packet_with_mdh_len,
-    obfuscate_client_eph_pub, process_server_hello_with_mdh_len, RecvWindow,
+    build_inner_packet, build_zero_mdh_packet, decode_packet_with_mdh_len,
+    obfuscate_client_eph_pub, process_server_hello_with_mdh_len, RecvWindow, DEFAULT_ZERO_MDH,
 };
 use aivpn_common::crypto::{
     derive_session_keys, KeyPair, SessionKeys,
@@ -137,7 +137,6 @@ pub async fn run_tunnel_android(
     server_port: u16,
     server_key: [u8; 32],
     psk: Option<[u8; 32]>,
-    mdh_len: usize,
 ) -> Result<()> {
     let session = Arc::new(SessionRuntime::new());
     let _active_session_guard = activate_session(session.clone())?;
@@ -180,7 +179,7 @@ pub async fn run_tunnel_android(
                           send_seq: &mut u16|
      -> Result<Vec<u8>> {
         let inner = build_inner_packet(InnerType::Control, *send_seq, &keepalive);
-        let pkt = build_random_mdh_packet(keys, send_counter, &inner, Some(&obf_pub), mdh_len)?;
+        let pkt = build_zero_mdh_packet(keys, send_counter, &inner, Some(&obf_pub))?;
         *send_seq = send_seq.wrapping_add(1);
         Ok(pkt)
     };
@@ -222,7 +221,7 @@ pub async fn run_tunnel_android(
         &keypair,
         &mut recv_win,
         &mut send_counter,
-        mdh_len,
+        DEFAULT_ZERO_MDH.len(),
     )?;
     let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
         &dh,
@@ -290,9 +289,6 @@ pub async fn run_tunnel_android(
             fn encrypt_data(&mut self, payload: &[u8]) -> aivpn_common::error::Result<Vec<u8>> {
                 self.inner.encrypt_data(payload)
             }
-            fn encrypt_control(&mut self, payload: &aivpn_common::protocol::ControlPayload) -> aivpn_common::error::Result<Vec<u8>> {
-                self.inner.encrypt_control(payload)
-            }
             fn encrypt_keepalive(&mut self) -> aivpn_common::error::Result<Vec<u8>> {
                 self.inner.encrypt_keepalive()
             }
@@ -304,7 +300,7 @@ pub async fn run_tunnel_android(
         }
 
         let mut enc = AndroidEncryptor {
-            inner: ZeroMdhEncryptor::with_mdh_len(keys_tx, send_counter, send_seq, mdh_len),
+            inner: ZeroMdhEncryptor::new(keys_tx, send_counter, send_seq),
             session: session_for_upload,
         };
         let config = UploadConfig {
@@ -312,7 +308,7 @@ pub async fn run_tunnel_android(
             ..Default::default()
         };
 
-        if let Err(e) = upload_pipeline::run_upload_loop(&mut tun_rx, None, &udp_tx, &mut enc, &config).await {
+        if let Err(e) = upload_pipeline::run_upload_loop(&mut tun_rx, &udp_tx, &mut enc, &config).await {
             let _ = sender_err_tx.send(format!("Upload pipeline: {e}")).await;
         }
     });
@@ -350,7 +346,7 @@ pub async fn run_tunnel_android(
                     &udp_buf[..n],
                     &keys,
                     &mut recv_win,
-                    mdh_len,
+                    DEFAULT_ZERO_MDH.len(),
                 ) {
                     Ok(decoded) => {
                         Some(decoded)
@@ -361,7 +357,7 @@ pub async fn run_tunnel_android(
                                 &udp_buf[..n],
                                 fallback_keys,
                                 &mut transition_recv_win,
-                                mdh_len,
+                                DEFAULT_ZERO_MDH.len(),
                             ).ok()
                         } else {
                             None

@@ -4,7 +4,6 @@ use aivpn_server::{AivpnServer, ServerArgs, ClientDatabase};
 use aivpn_server::gateway::GatewayConfig;
 use aivpn_server::neural::NeuralConfig;
 use aivpn_common::crypto;
-use aivpn_common::mask::MaskProfile;
 use aivpn_common::network_config::{
     netmask_to_prefix_len, ClientNetworkConfig, DEFAULT_VPN_MTU, VpnNetworkConfig,
 };
@@ -25,10 +24,6 @@ struct ServerFileConfig {
     tun_addr: Option<Ipv4Addr>,
     tun_netmask: Option<Ipv4Addr>,
     network_config: Option<VpnNetworkConfig>,
-    mask_dir: Option<String>,
-    bootstrap_mask_files: Option<Vec<String>>,
-    session_timeout_secs: Option<u64>,
-    idle_timeout_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -40,10 +35,6 @@ async fn main() {
     let file_config = load_server_file_config(config_path.as_deref());
     let network_config = resolve_network_config(file_config.as_ref()).unwrap_or_else(|e| {
         eprintln!("Failed to resolve VPN network config: {}", e);
-        std::process::exit(1);
-    });
-    let bootstrap_masks = load_bootstrap_masks(file_config.as_ref()).unwrap_or_else(|e| {
-        eprintln!("Failed to load bootstrap masks: {}", e);
         std::process::exit(1);
     });
 
@@ -79,8 +70,6 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("aivpn_server=debug".parse().unwrap())
-                .add_directive("aivpn_common=debug".parse().unwrap())
         )
         .init();
 
@@ -140,10 +129,6 @@ async fn main() {
         enable_neural: true,
         neural_config: NeuralConfig::default(),
         client_db: Some(client_db),
-        mask_dir: resolve_mask_dir(&args, file_config.as_ref()),
-        session_timeout_secs: file_config.as_ref().and_then(|c| c.session_timeout_secs),
-        idle_timeout_secs: file_config.as_ref().and_then(|c| c.idle_timeout_secs),
-        bootstrap_masks,
     };
 
     // Create and run server
@@ -188,7 +173,7 @@ fn build_connection_key(
         "k": server_pub_b64,
         "p": psk_b64,
         "i": client_network_config.client_ip,
-        "n": client_network_config,
+        "n": client_network_config
     });
     let json_bytes = serde_json::to_string(&json).unwrap();
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
@@ -421,37 +406,6 @@ fn resolve_listen_addr(args: &ServerArgs, file_config: Option<&ServerFileConfig>
     }
 }
 
-fn load_bootstrap_masks(file_config: Option<&ServerFileConfig>) -> Result<Vec<MaskProfile>, String> {
-    let Some(files) = file_config.and_then(|config| config.bootstrap_mask_files.clone()) else {
-        return Ok(Vec::new());
-    };
-
-    let mut masks = Vec::with_capacity(files.len());
-    for file in files {
-        let content = std::fs::read_to_string(&file)
-            .map_err(|e| format!("{}: {}", file, e))?;
-        let mask = serde_json::from_str::<MaskProfile>(&content)
-            .map_err(|e| format!("{}: {}", file, e))?;
-        masks.push(mask);
-    }
-    Ok(masks)
-}
-
-/// Resolve mask directory: CLI --mask-dir / env AIVPN_MASK_DIR → server.json "mask_dir" → default
-const DEFAULT_MASK_DIR: &str = "/var/lib/aivpn/masks";
-
-fn resolve_mask_dir(args: &ServerArgs, file_config: Option<&ServerFileConfig>) -> PathBuf {
-    // CLI/env already handled by clap (env = "AIVPN_MASK_DIR")
-    if let Some(ref dir) = args.mask_dir {
-        return PathBuf::from(dir);
-    }
-    // server.json
-    if let Some(ref dir) = file_config.and_then(|c| c.mask_dir.clone()) {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from(DEFAULT_MASK_DIR)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,7 +424,6 @@ mod tests {
             show_client: None,
             server_ip: None,
             per_ip_pps_limit: 1000,
-            mask_dir: None,
         }
     }
 
@@ -499,7 +452,6 @@ mod tests {
                 server_vpn_ip: Ipv4Addr::new(10, 0, 0, 1),
                 prefix_len: 24,
                 mtu: 1346,
-                mdh_len: 20,
             },
         );
         let payload = key.strip_prefix("aivpn://").unwrap();
@@ -524,10 +476,6 @@ mod tests {
                 prefix_len: 24,
                 mtu: 1400,
             }),
-            mask_dir: None,
-            bootstrap_mask_files: None,
-            session_timeout_secs: None,
-            idle_timeout_secs: None,
         };
 
         let resolved = resolve_network_config(Some(&file_config)).unwrap();

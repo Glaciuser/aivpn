@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
-use crate::client_wire::{build_inner_packet, build_random_mdh_packet, DEFAULT_MDH_LEN};
+use crate::client_wire::{build_inner_packet, build_zero_mdh_packet};
 use crate::crypto::SessionKeys;
 use crate::error::{Error, Result};
 use crate::protocol::{ControlPayload, InnerType};
@@ -44,8 +44,6 @@ impl Default for UploadConfig {
 pub trait PacketEncryptor: Send {
     /// Encrypt a TUN data payload into a ready-to-send UDP datagram.
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
-    /// Encrypt an arbitrary control message into a ready-to-send UDP datagram.
-    fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>>;
     /// Encrypt a keepalive control message into a ready-to-send UDP datagram.
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>>;
     /// Called after a data datagram has been successfully sent.
@@ -55,23 +53,17 @@ pub trait PacketEncryptor: Send {
 
 // ──────────── Ready-made encryptor: zero MDH ────────────
 
-/// Encryptor using random MDH — suitable for Android and any
+/// Encryptor using `build_zero_mdh_packet` — suitable for Android and any
 /// client that does not require Mimicry traffic shaping.
-/// Each packet gets fresh random MDH bytes (Issue #30 fix).
 pub struct ZeroMdhEncryptor {
     keys: SessionKeys,
     counter: u64,
     seq: u16,
-    mdh_len: usize,
 }
 
 impl ZeroMdhEncryptor {
     pub fn new(keys: SessionKeys, counter: u64, seq: u16) -> Self {
-        Self { keys, counter, seq, mdh_len: DEFAULT_MDH_LEN }
-    }
-
-    pub fn with_mdh_len(keys: SessionKeys, counter: u64, seq: u16, mdh_len: usize) -> Self {
-        Self { keys, counter, seq, mdh_len }
+        Self { keys, counter, seq }
     }
 }
 
@@ -79,21 +71,14 @@ impl PacketEncryptor for ZeroMdhEncryptor {
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let inner = build_inner_packet(InnerType::Data, self.seq, payload);
         self.seq = self.seq.wrapping_add(1);
-        build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)
-    }
-
-    fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
-        let bytes = payload.encode()?;
-        let inner = build_inner_packet(InnerType::Control, self.seq, &bytes);
-        self.seq = self.seq.wrapping_add(1);
-        build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)
+        build_zero_mdh_packet(&self.keys, &mut self.counter, &inner, None)
     }
 
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
         let keepalive = ControlPayload::Keepalive.encode()?;
         let inner = build_inner_packet(InnerType::Control, self.seq, &keepalive);
         self.seq = self.seq.wrapping_add(1);
-        build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)
+        build_zero_mdh_packet(&self.keys, &mut self.counter, &inner, None)
     }
 
     fn on_data_sent(&mut self, _payload_len: usize) {}
@@ -133,7 +118,6 @@ async fn send_tolerant(udp: &UdpSocket, data: &[u8]) -> Result<()> {
 /// caller is expected to `.abort()` the task when the session ends.
 pub async fn run_upload_loop(
     rx: &mut mpsc::Receiver<Vec<u8>>,
-    mut control_rx: Option<&mut mpsc::Receiver<ControlPayload>>,
     udp: &Arc<UdpSocket>,
     enc: &mut impl PacketEncryptor,
     config: &UploadConfig,
@@ -179,20 +163,6 @@ pub async fn run_upload_loop(
             _ = ka_interval.tick() => {
                 let encrypted = enc.encrypt_keepalive()?;
                 send_tolerant(udp, &encrypted).await?;
-            }
-
-            // ── Control payloads ──
-            maybe_ctrl = async {
-                if let Some(crx) = control_rx.as_mut() {
-                    crx.recv().await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                if let Some(payload) = maybe_ctrl {
-                    let encrypted = enc.encrypt_control(&payload)?;
-                    send_tolerant(udp, &encrypted).await?;
-                }
             }
         }
     }

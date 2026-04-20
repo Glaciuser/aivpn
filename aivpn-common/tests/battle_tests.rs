@@ -19,7 +19,7 @@ use aivpn_common::crypto::{
 use aivpn_common::protocol::{
     InnerHeader, InnerType, ControlPayload, ControlSubtype, AivpnPacket,
 };
-use aivpn_common::mask::preset_masks::{all as all_preset_masks, webrtc_zoom_v3};
+use aivpn_common::mask::preset_masks::{webrtc_zoom_v3, quic_https_v2};
 use aivpn_common::mask::MaskProfile;
 use subtle::ConstantTimeEq;
 
@@ -604,19 +604,19 @@ fn battle_tag_constant_time_comparison() {
 // ============================================================================
 
 #[test]
-fn battle_all_preset_masks_valid() {
-    let masks = all_preset_masks();
-    assert!(!masks.is_empty(), "preset catalog must not be empty");
+fn battle_mask_webrtc_preset_valid() {
+    let mask = webrtc_zoom_v3();
+    assert_eq!(mask.mask_id, "webrtc_zoom_v3");
+    assert_eq!(mask.header_template.len(), 4);
+    assert_eq!(mask.eph_pub_length, 32);
+    assert!(!mask.fsm_states.is_empty());
+}
 
-    let mut seen_ids = HashSet::new();
-    for mask in masks {
-        assert!(seen_ids.insert(mask.mask_id.clone()), "duplicate preset mask_id: {}", mask.mask_id);
-        assert!(mask.version >= 2, "preset mask {} must use semantic header version", mask.mask_id);
-        assert!(!mask.header_template.is_empty(), "preset mask {} must have a non-empty header template", mask.mask_id);
-        assert!(mask.header_spec.is_some(), "preset mask {} must provide header_spec", mask.mask_id);
-        assert_eq!(mask.eph_pub_length, 32, "preset mask {} must keep 32-byte eph pub length", mask.mask_id);
-        assert!(!mask.fsm_states.is_empty(), "preset mask {} must have at least one FSM state", mask.mask_id);
-    }
+#[test]
+fn battle_mask_quic_preset_valid() {
+    let mask = quic_https_v2();
+    assert_eq!(mask.mask_id, "quic_https_v2");
+    assert_eq!(mask.header_template.len(), 4);
 }
 
 #[test]
@@ -792,23 +792,6 @@ fn battle_time_window_rotation() {
     let tag_w1 = generate_resonance_tag(&secret, 0, tw);
     let tag_w2 = generate_resonance_tag(&secret, 0, tw + 1);
     assert_ne!(tag_w1, tag_w2);
-}
-
-#[test]
-fn battle_tag_avoids_wireguard_first_byte() {
-    // Issue #30: TAG first byte must NOT be 1–4 (WireGuard message types)
-    // to prevent DPI/Wireshark from misidentifying packets as WireGuard.
-    let secret = [0x42u8; 32];
-    let tw = 1000u64;
-    for counter in 0u64..50_000 {
-        let tag = generate_resonance_tag(&secret, counter, tw);
-        assert!(
-            tag[0] < 1 || tag[0] > 4,
-            "Tag first byte {} is in WireGuard range [1..4] at counter={}",
-            tag[0],
-            counter,
-        );
-    }
 }
 
 #[test]

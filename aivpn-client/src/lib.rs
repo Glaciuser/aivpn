@@ -4,14 +4,12 @@
 //! - TUN device for packet capture
 //! - Mimicry Engine for traffic shaping
 //! - Key exchange and session management
-//! - Auto Mask Recording CLI support
 
 pub mod client;
-pub mod bootstrap_cache;
-pub mod bootstrap_loader;
+pub mod local_socks;
 pub mod mimicry;
+pub mod netns;
 pub mod tunnel;
-pub mod record_cmd;
 
 pub use client::AivpnClient;
 pub use mimicry::MimicryEngine;

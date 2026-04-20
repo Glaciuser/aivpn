@@ -19,7 +19,6 @@ COPY aivpn-server aivpn-server/
 COPY aivpn-client aivpn-client/
 COPY aivpn-android-core aivpn-android-core/
 COPY aivpn-windows aivpn-windows/
-COPY mask-assets mask-assets/
 
 # Build in release mode (Cargo.lock is auto-generated if missing)
 RUN cargo build --release --bin aivpn-server
@@ -43,21 +42,14 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/aivpn-server /usr/local/bin/aivpn-server
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Create config directory and TUN device node
-RUN mkdir -p /etc/aivpn /dev/net /var/lib/aivpn/bootstrap /var/lib/aivpn/masks && \
+RUN mkdir -p /etc/aivpn /dev/net && \
     mknod /dev/net/tun c 10 200 2>/dev/null || true && \
-    chmod 600 /dev/net/tun && \
-    chmod +x /usr/local/bin/docker-entrypoint.sh && \
-    mkdir -p /usr/share/aivpn && \
-    echo '[]' > /var/lib/aivpn/bootstrap/custom-bootstrap-mask.json
+    chmod 600 /dev/net/tun
 
 # Copy example config
-COPY config/server.json.example /usr/share/aivpn/server.json.example
-
-# Seed preset masks so server has masks on first run
-COPY mask-assets/*.json /usr/share/aivpn/preset-masks/
+COPY config/server.json.example /etc/aivpn/server.json
 
 # Expose port
 EXPOSE 443/udp
@@ -67,5 +59,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD test "$(basename "$(readlink /proc/1/exe 2>/dev/null)")" = "aivpn-server" || exit 1
 
 # Run as root (required for TUN device and NAT)
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/aivpn-server"]
 CMD ["--config", "/etc/aivpn/server.json", "--listen", "0.0.0.0:443", "--key-file", "/etc/aivpn/server.key"]

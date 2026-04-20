@@ -15,7 +15,6 @@ use aivpn_common::network_config::{ClientNetworkConfig, LEGACY_SERVER_VPN_IP, Vp
 // the inner header is part of the plaintext payload, so the TUN MTU must leave
 // room for it as well.
 const WAN_SAFE_TUN_MTU: u16 = 1346;
-
 /// Tunnel configuration
 #[derive(Debug, Clone)]
 pub struct TunnelConfig {
@@ -69,7 +68,6 @@ impl TunnelConfig {
             server_vpn_ip,
             prefix_len: self.prefix_len,
             mtu: self.mtu,
-            mdh_len: 20,
         };
         network_config.validate()?;
         Ok(network_config)
@@ -215,7 +213,7 @@ impl Tunnel {
 
         #[cfg(target_os = "linux")]
         {
-            config_builder.name(&self.config.tun_name);
+            config_builder.tun_name(&self.config.tun_name);
             config_builder.platform_config(|config| {
                 config.ensure_root_privileges(true);
             });
@@ -473,7 +471,52 @@ impl Tunnel {
     pub fn set_server_ip(&mut self, server_ip: String) {
         self.server_ip = Some(server_ip);
     }
-    
+
+    /// Enable default routing via TUN inside a dedicated SOCKS network namespace.
+    #[cfg(target_os = "linux")]
+    pub fn enable_socks_namespace_routing(&mut self) -> Result<()> {
+        use std::process::Command;
+
+        let tun_name = &self.config.tun_name;
+        let tun_addr = self.config.tun_addr.as_str();
+        let vpn_subnet = self.config.vpn_network_config()?.cidr_string();
+
+        let route_commands = [
+            vec!["route", "replace", vpn_subnet.as_str(), "dev", tun_name, "src", tun_addr],
+            vec!["route", "replace", "0.0.0.0/1", "dev", tun_name, "src", tun_addr],
+            vec!["route", "replace", "128.0.0.0/1", "dev", tun_name, "src", tun_addr],
+        ];
+
+        for args in route_commands {
+            let status = Command::new("ip")
+                .args(&args)
+                .status()
+                .map_err(|e| Error::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to install SOCKS namespace route: {}", e),
+                )))?;
+            if !status.success() {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to install SOCKS namespace route via {}", tun_name),
+                )));
+            }
+        }
+
+        info!(
+            "Enabled SOCKS namespace routing via {} src {}",
+            tun_name, tun_addr
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_socks_namespace_routing(&mut self) -> Result<()> {
+        Err(Error::Session(
+            "Local SOCKS5 mode is currently supported on Linux only".into(),
+        ))
+    }
+
     /// Enable full-tunnel mode: route all traffic through VPN
     #[cfg(target_os = "macos")]
     pub fn enable_full_tunnel(&mut self) -> Result<()> {

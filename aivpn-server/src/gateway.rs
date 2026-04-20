@@ -25,9 +25,7 @@ use aivpn_common::protocol::{
     InnerType, InnerHeader, ControlPayload, ControlSubtype,
     MAX_PACKET_SIZE,
 };
-use aivpn_common::mask::{
-    current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
-};
+use aivpn_common::mask::MaskProfile;
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::VpnNetworkConfig;
 
@@ -36,10 +34,6 @@ use crate::nat::NatForwarder;
 use crate::neural::{NeuralResonanceModule, NeuralConfig, ResonanceStatus};
 use crate::metrics::MetricsCollector;
 use crate::client_db::ClientDatabase;
-use crate::recording::RecordingManager;
-use crate::recording::{RecordingStopOutcome, RecordingStopReason};
-use crate::mask_gen::generate_and_store_mask;
-use crate::mask_store::MaskStore;
 
 struct QueuedPacket {
     packet_data: Vec<u8>,
@@ -64,14 +58,6 @@ pub struct GatewayConfig {
     pub neural_config: NeuralConfig,
     /// Client database for PSK-based authentication
     pub client_db: Option<Arc<ClientDatabase>>,
-    /// Directory for mask storage (default: /var/lib/aivpn/masks)
-    pub mask_dir: std::path::PathBuf,
-    /// Session hard timeout in seconds (default: 7 days). `None` uses the default.
-    pub session_timeout_secs: Option<u64>,
-    /// Session idle timeout in seconds (default: 300). `None` uses the default.
-    pub idle_timeout_secs: Option<u64>,
-    /// Optional custom bootstrap masks embedded into signed descriptors.
-    pub bootstrap_masks: Vec<MaskProfile>,
 }
 
 impl Default for GatewayConfig {
@@ -89,10 +75,6 @@ impl Default for GatewayConfig {
             enable_neural: true,
             neural_config: NeuralConfig::default(),
             client_db: None,
-            mask_dir: std::path::PathBuf::from("/var/lib/aivpn/masks"),
-            session_timeout_secs: None,
-            idle_timeout_secs: None,
-            bootstrap_masks: Vec::new(),
         }
     }
 }
@@ -106,22 +88,21 @@ pub struct MaskCatalog {
     masks: DashMap<String, MaskProfile>,
     /// Compromised mask IDs — never reuse
     compromised: DashMap<String, Instant>,
-    /// Primary mask used for initial handshake parsing.
-    primary_mask_id: parking_lot::Mutex<String>,
 }
 
 impl MaskCatalog {
     pub fn new() -> Self {
-        Self {
+        use aivpn_common::mask::preset_masks;
+        let catalog = Self {
             masks: DashMap::new(),
             compromised: DashMap::new(),
-            primary_mask_id: parking_lot::Mutex::new(String::new()),
-        }
-    }
-
-    /// Set the primary mask ID (first mask loaded from disk)
-    pub fn set_primary_mask_id(&self, mask_id: String) {
-        *self.primary_mask_id.lock() = mask_id;
+        };
+        // Seed with built-in masks
+        let m1 = preset_masks::webrtc_zoom_v3();
+        let m2 = preset_masks::quic_https_v2();
+        catalog.masks.insert(m1.mask_id.clone(), m1);
+        catalog.masks.insert(m2.mask_id.clone(), m2);
+        catalog
     }
 
     /// Register a new mask (e.g., received via passive distribution or neural unpack)
@@ -137,11 +118,6 @@ impl MaskCatalog {
         self.masks.remove(mask_id);
     }
 
-    /// Remove a mask from live rotation without marking it as compromised.
-    pub fn remove_mask(&self, mask_id: &str) {
-        self.masks.remove(mask_id);
-    }
-
     /// Select the best non-compromised mask, excluding `current_mask_id`
     pub fn select_fallback(&self, current_mask_id: &str) -> Option<MaskProfile> {
         self.masks.iter()
@@ -153,54 +129,6 @@ impl MaskCatalog {
     /// Get mask count
     pub fn available_count(&self) -> usize {
         self.masks.len()
-    }
-
-    /// Get the primary packet layout for client->server traffic.
-    /// Returns `(packet_mdh_len, handshake_mdh_len, eph_offset, eph_len)`.
-    /// Normal packets use only the protocol header, while the initial
-    /// handshake embeds `eph_pub` inside the MDH at `eph_offset`.
-    pub fn packet_layout(&self) -> (usize, usize, usize, usize) {
-        let fallback = (20usize, 52usize, 20usize, 32usize);
-        let Some(mask) = self.primary_mask() else {
-            return fallback;
-        };
-
-        packet_layout_for_mask(&mask)
-    }
-
-    /// Get the regular MDH bytes used for server->client packets.
-    /// Uses HeaderSpec for dynamic per-packet generation when available (Issue #30 fix).
-    pub fn packet_mdh_bytes(&self) -> Vec<u8> {
-        self.primary_mask()
-            .map(|mask| packet_mdh_bytes_for_mask(&mask))
-            .unwrap_or_else(|| vec![0u8; 20])
-    }
-
-    pub fn primary_mask(&self) -> Option<MaskProfile> {
-        let primary_id = self.primary_mask_id.lock().clone();
-        self.masks.get(&primary_id)
-            .map(|entry| entry.value().clone())
-            .or_else(|| self.masks.iter().next().map(|entry| entry.value().clone()))
-    }
-}
-
-fn packet_layout_for_mask(mask: &MaskProfile) -> (usize, usize, usize, usize) {
-    let eph_offset = mask.eph_pub_offset as usize;
-    let eph_len = mask.eph_pub_length as usize;
-    let packet_mdh_len = mask.header_spec
-        .as_ref()
-        .map(|spec| spec.min_length())
-        .unwrap_or_else(|| mask.header_template.len());
-    let handshake_mdh_len = packet_mdh_len.max(eph_offset.saturating_add(eph_len));
-    (packet_mdh_len, handshake_mdh_len, eph_offset, eph_len)
-}
-
-fn packet_mdh_bytes_for_mask(mask: &MaskProfile) -> Vec<u8> {
-    if let Some(ref spec) = mask.header_spec {
-        let mut rng = rand::thread_rng();
-        spec.generate(&mut rng)
-    } else {
-        mask.header_template.clone()
     }
 }
 
@@ -231,195 +159,14 @@ pub struct Gateway {
     metrics: Arc<MetricsCollector>,
     /// Client database for PSK-based authentication
     client_db: Option<Arc<ClientDatabase>>,
-    /// Recording manager for auto mask recording
-    recording_manager: Option<Arc<RecordingManager>>,
-    /// Mask store for auto-generated masks
-    #[allow(dead_code)]
-    mask_store: Option<Arc<MaskStore>>,
-    /// Active bootstrap descriptors for previous/current/next epochs.
-    bootstrap_descriptors: Vec<BootstrapDescriptor>,
-}
-
-const BOOTSTRAP_ROTATION_SECS: u64 = 24 * 3600;
-const BOOTSTRAP_DESCRIPTOR_CANDIDATES: u8 = 4;
-
-fn bootstrap_epoch(unix_secs: u64) -> u64 {
-    unix_secs / BOOTSTRAP_ROTATION_SECS
-}
-
-pub fn derive_server_signing_key(server_private_key: &[u8; 32]) -> ed25519_dalek::SigningKey {
-    let seed = blake3::derive_key("aivpn-ed25519-signing-v1", server_private_key);
-    ed25519_dalek::SigningKey::from_bytes(&seed)
-}
-
-fn sign_bootstrap_descriptor(
-    mut descriptor: BootstrapDescriptor,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> BootstrapDescriptor {
-    use ed25519_dalek::Signer;
-    descriptor.signature = signing_key.sign(&descriptor.signing_bytes()).to_bytes();
-    descriptor
-}
-
-fn build_bootstrap_descriptor(
-    server_seed: &[u8; 32],
-    signing_key: &ed25519_dalek::SigningKey,
-    epoch: u64,
-    bootstrap_masks: &[MaskProfile],
-) -> BootstrapDescriptor {
-    let mut hasher = blake3::Hasher::new_keyed(server_seed);
-    hasher.update(&epoch.to_le_bytes());
-    let hash = hasher.finalize();
-    let mut kdf_salt = [0u8; 32];
-    kdf_salt.copy_from_slice(&hash.as_bytes()[..32]);
-    let created_at = epoch * BOOTSTRAP_ROTATION_SECS;
-    let expires_at = created_at + (2 * BOOTSTRAP_ROTATION_SECS);
-    let (base_mask_ids, embedded_masks) = if bootstrap_masks.is_empty() {
-        (
-            aivpn_common::mask::preset_masks::all()
-                .into_iter()
-                .map(|mask| mask.mask_id)
-                .collect(),
-            Vec::new(),
-        )
-    } else {
-        (Vec::new(), bootstrap_masks.to_vec())
-    };
-
-    sign_bootstrap_descriptor(
-        BootstrapDescriptor {
-            descriptor_id: format!("epoch-{}", epoch),
-            version: 1,
-            created_at,
-            expires_at,
-            base_mask_ids,
-            embedded_masks,
-            candidate_count: BOOTSTRAP_DESCRIPTOR_CANDIDATES,
-            kdf_salt,
-            signature: [0u8; 64],
-        },
-        signing_key,
-    )
-}
-
-pub fn build_bootstrap_descriptors(
-    server_seed: &[u8; 32],
-    signing_key: &ed25519_dalek::SigningKey,
-    bootstrap_masks: &[MaskProfile],
-) -> Vec<BootstrapDescriptor> {
-    let epoch = bootstrap_epoch(current_unix_secs());
-    [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)]
-        .into_iter()
-        .map(|value| build_bootstrap_descriptor(server_seed, signing_key, value, bootstrap_masks))
-        .collect()
 }
 
 impl Gateway {
-    fn can_start_recording(&self, client_id: Option<&str>) -> bool {
-        let Some(client_id) = client_id else {
-            return false;
-        };
-
-        if client_id == "admin" {
-            return true;
-        }
-
-        self.client_db
-            .as_ref()
-            .and_then(|db| db.find_by_id(client_id))
-            .map(|client| client.name.starts_with("recording-admin"))
-            .unwrap_or(false)
-    }
-
-    async fn handle_recording_outcome(
-        socket: &Arc<UdpSocket>,
-        sessions: &Arc<SessionManager>,
-        store: &Arc<MaskStore>,
-        mdh: &[u8],
-        outcome: RecordingStopOutcome,
-        notify_session: Option<Arc<parking_lot::Mutex<Session>>>,
-    ) {
-        match outcome {
-            RecordingStopOutcome::Completed(completed) => {
-                if let Some(ref session) = notify_session {
-                    let ack = ControlPayload::RecordingAck {
-                        session_id: completed.session_id,
-                        status: "analyzing".into(),
-                    };
-                    if let Err(e) = Self::send_control_message_via(socket.as_ref(), mdh, &ack, session).await {
-                        warn!("Failed to send RecordingAck: {}", e);
-                    }
-                }
-
-                info!(
-                    "Recording stopped for '{}' ({} packets, {}s), analyzing...",
-                    completed.service, completed.total_packets, completed.duration_secs
-                );
-
-                let socket = socket.clone();
-                let sessions = sessions.clone();
-                let store = store.clone();
-                let mdh = mdh.to_vec();
-                tokio::spawn(async move {
-                    match generate_and_store_mask(&completed.service, &completed.packets, &store).await {
-                        Ok(mask_id) => {
-                            info!(
-                                "✅ Mask generated: '{}' for service '{}' by {}",
-                                mask_id, completed.service, completed.admin_key_id
-                            );
-                            if let Some(target_session) = sessions.get_session(&completed.session_id) {
-                                let confidence = store
-                                    .get_mask(&mask_id)
-                                    .map(|entry| entry.stats.confidence)
-                                    .unwrap_or(0.0);
-                                let payload = ControlPayload::RecordingComplete {
-                                    service: completed.service.clone(),
-                                    mask_id,
-                                    confidence,
-                                };
-                                if let Err(e) = Self::send_control_message_via(socket.as_ref(), &mdh, &payload, &target_session).await {
-                                    warn!("Failed to send RecordingComplete: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Mask generation failed for '{}': {}", completed.service, e);
-                            if let Some(target_session) = sessions.get_session(&completed.session_id) {
-                                let payload = ControlPayload::RecordingFailed {
-                                    reason: e.to_string(),
-                                };
-                                if let Err(send_err) = Self::send_control_message_via(socket.as_ref(), &mdh, &payload, &target_session).await {
-                                    warn!("Failed to send RecordingFailed: {}", send_err);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            RecordingStopOutcome::Incomplete(incomplete) => {
-                let reason = match incomplete.reason {
-                    RecordingStopReason::IdleTimeout => "Recording stopped after idle timeout before enough traffic was captured",
-                    RecordingStopReason::SessionEnded => "Recording ended with the session before enough traffic was captured",
-                    _ => "Too few packets or too short duration",
-                };
-                if let Some(ref session) = notify_session {
-                    let payload = ControlPayload::RecordingFailed {
-                        reason: reason.into(),
-                    };
-                    if let Err(e) = Self::send_control_message_via(socket.as_ref(), mdh, &payload, session).await {
-                        warn!("Failed to send RecordingFailed: {}", e);
-                    }
-                }
-                warn!(
-                    "Recording for '{}' ended without mask generation: {} packets, {}s ({:?})",
-                    incomplete.service, incomplete.total_packets, incomplete.duration_secs, incomplete.reason
-                );
-            }
-            RecordingStopOutcome::NotFound => {}
-        }
-    }
-
     pub fn new(config: GatewayConfig) -> Result<Self> {
+        use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+        
         // Create server keypair (use config key if provided, otherwise generate ephemeral)
         let server_keys = if config.server_private_key != [0u8; 32] {
             crypto::KeyPair::from_private_key(config.server_private_key)
@@ -428,46 +175,21 @@ impl Gateway {
         };
         
         // Create Ed25519 signing key
-        let signing_key = derive_server_signing_key(&config.server_private_key);
-        let bootstrap_descriptors = build_bootstrap_descriptors(&config.server_private_key, &signing_key, &config.bootstrap_masks);
+        let mut key_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut key_bytes);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
         
-        // Initialize mask catalog (empty — populated from disk only)
-        let mask_catalog = Arc::new(MaskCatalog::new());
+        // Create default mask
+        let default_mask = webrtc_zoom_v3();
         
-        // Initialize mask store — loads masks from disk into catalog
-        let mask_store = Arc::new(MaskStore::new(
-            mask_catalog.clone(),
-            config.mask_dir.clone(),
-        ));
-        
-        // Runtime primary mask is selected from the masks loaded on disk.
-        // Bootstrap compatibility is handled separately using built-in presets.
-        let primary_id = if let Some(first) = mask_catalog.masks.iter().next() {
-            let id = first.key().clone();
-            id
-        } else {
-            String::new()
-        };
-        if !primary_id.is_empty() {
-            info!("Primary mask set to '{}' (loaded from disk)", primary_id);
-            mask_catalog.set_primary_mask_id(primary_id);
-        } else {
-            warn!("No masks found in {:?} — server will not accept connections until masks are recorded", config.mask_dir);
-        }
-        
-        // Get default mask from catalog (required — at least one mask must exist on disk)
-        let default_mask = mask_catalog.primary_mask()
-            .ok_or_else(|| Error::Session(
-                format!("No masks found in {:?} — place mask JSON files there before starting the server", config.mask_dir)
-            ))?;
-        
-        let session_manager = Arc::new(SessionManager::with_timeouts(
+        let session_manager = Arc::new(SessionManager::new(
             server_keys,
             signing_key,
             default_mask,
-            config.session_timeout_secs,
-            config.idle_timeout_secs,
         ));
+        
+        // Initialize mask catalog (Patent 3 — fallback pool)
+        let mask_catalog = Arc::new(MaskCatalog::new());
         
         // Initialize neural resonance module (Patent 1)
         let mut neural = NeuralResonanceModule::new(config.neural_config.clone())
@@ -483,9 +205,7 @@ impl Gateway {
             info!("Neural Resonance Module initialized (Patent 1)");
         }
         
-        let recording_manager = Arc::new(RecordingManager::new(mask_store.clone()));
-        info!("Auto Mask Recording system initialized ({} masks loaded from disk)", mask_catalog.available_count());
-
+        // NAT forwarder is created lazily in run() to avoid requiring root at construction time
         Ok(Self {
             config: config.clone(),
             session_manager,
@@ -498,24 +218,7 @@ impl Gateway {
             mask_catalog,
             metrics: Arc::new(MetricsCollector::new()),
             client_db: config.client_db,
-            recording_manager: Some(recording_manager),
-            mask_store: Some(mask_store),
-            bootstrap_descriptors,
         })
-    }
-
-    async fn send_bootstrap_descriptors(
-        &self,
-        session: &Arc<parking_lot::Mutex<Session>>,
-    ) -> Result<()> {
-        for descriptor in &self.bootstrap_descriptors {
-            let payload = ControlPayload::BootstrapDescriptorUpdate {
-                descriptor_data: rmp_serde::to_vec(descriptor)
-                    .map_err(|e| Error::Session(format!("Failed to serialize bootstrap descriptor: {}", e)))?,
-            };
-            self.send_control_message(&payload, session).await?;
-        }
-        Ok(())
     }
     
     /// Start the gateway
@@ -585,11 +288,8 @@ impl Gateway {
             if let Some(tun_reader) = nat.take_reader().await {
                 let sessions = self.session_manager.clone();
                 let socket = self.udp_socket.as_ref().unwrap().clone();
-                let mask = self.mask_catalog.masks.iter().next()
-                    .map(|e| e.value().clone())
-                    .expect("at least one mask must be loaded");
+                let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
                 let server_vpn_ip = self.config.network_config.server_vpn_ip;
-                let recorder = self.recording_manager.clone();
                 
                 // Channel for writing packets to TUN device (upload + ICMP replies)
                 let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(4096);
@@ -606,45 +306,22 @@ impl Gateway {
                 }
                 
                 tokio::spawn(async move {
-                    Self::tun_read_loop(tun_reader, tun_tx, sessions, socket, mask, server_vpn_ip, recorder).await;
+                    Self::tun_read_loop(tun_reader, tun_tx, sessions, socket, mask, server_vpn_ip).await;
                 });
                 info!("TUN read loop spawned");
             }
         }
         
-        // Spawn periodic session cleanup task (remove expired/idle sessions and stop recordings)
+        // Spawn periodic session cleanup task (remove expired/idle sessions)
         {
             let sessions = self.session_manager.clone();
-            let recorder = self.recording_manager.clone();
-            let socket = self.udp_socket.as_ref().unwrap().clone();
-            let mdh = self.mask_catalog.packet_mdh_bytes();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    if let Some(ref rec) = recorder {
-                        let store = rec.store();
-                        for outcome in rec.take_ready_or_stale(aivpn_common::recording::RECORDING_IDLE_TIMEOUT_SECS) {
-                            let notify_session = match &outcome {
-                                RecordingStopOutcome::Completed(completed) => sessions.get_session(&completed.session_id),
-                                RecordingStopOutcome::Incomplete(incomplete) => sessions.get_session(&incomplete.session_id),
-                                RecordingStopOutcome::NotFound => None,
-                            };
-                            Self::handle_recording_outcome(&socket, &sessions, &store, &mdh, outcome, notify_session).await;
-                        }
-                    }
-
-                    let removed = sessions.cleanup_expired();
-                    // Stop active recordings for removed sessions
-                    if let Some(ref rec) = recorder {
-                        let store = rec.store();
-                        for session_id in removed {
-                            let outcome = rec.stop_for_session_end(session_id);
-                            Self::handle_recording_outcome(&socket, &sessions, &store, &mdh, outcome, None).await;
-                        }
-                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    sessions.cleanup_expired();
                 }
             });
-            info!("Session cleanup / recording auto-finish task spawned (5s interval)");
+            info!("Session cleanup task spawned (60s interval)");
         }
         
         // Spawn client DB stats flush task (persist traffic stats every 5 min)
@@ -703,7 +380,7 @@ impl Gateway {
                 .filter_map(|entry| {
                     let sess = entry.value().lock();
                     let mask_id = sess.mask.as_ref().map(|m| m.mask_id.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .unwrap_or_else(|| "webrtc_zoom_v3".to_string());
                     Some((sess.session_id, mask_id))
                 })
                 .collect();
@@ -714,7 +391,7 @@ impl Gateway {
             
             // Collect mask update packets to send AFTER releasing the neural lock
             // (parking_lot::MutexGuard is !Send, cannot hold across .await)
-            let mut pending_sends: Vec<(Vec<u8>, std::net::SocketAddr, [u8; 16], MaskProfile)> = Vec::new();
+            let mut pending_sends: Vec<(Vec<u8>, std::net::SocketAddr)> = Vec::new();
             
             {
                 let neural_guard = neural.lock();
@@ -743,11 +420,13 @@ impl Gateway {
                                             catalog.available_count()
                                         );
                                         
-                                        if let Some(session) = sessions.get_session(session_id) {
-                                            let client_addr = session.lock().client_addr;
+                                        // Update session's mask and build notification packet
+                                        if let Some((session, client_addr)) =
+                                            sessions.update_session_mask(session_id, new_mask.clone())
+                                        {
                                             match sessions.build_mask_update_packet(&session, &new_mask) {
                                                 Ok(packet) => {
-                                                    pending_sends.push((packet, client_addr, *session_id, new_mask.clone()));
+                                                    pending_sends.push((packet, client_addr));
                                                 }
                                                 Err(e) => {
                                                     warn!("Failed to build MaskUpdate packet: {}", e);
@@ -790,10 +469,11 @@ impl Gateway {
                                 "Anomaly-triggered rotation to mask '{}'",
                                 new_mask.mask_id
                             );
-                            if let Some(session) = sessions.get_session(session_id) {
-                                let client_addr = session.lock().client_addr;
+                            if let Some((session, client_addr)) =
+                                sessions.update_session_mask(session_id, new_mask.clone())
+                            {
                                 if let Ok(packet) = sessions.build_mask_update_packet(&session, &new_mask) {
-                                    pending_sends.push((packet, client_addr, *session_id, new_mask.clone()));
+                                    pending_sends.push((packet, client_addr));
                                 }
                             }
                             metrics.record_mask_rotation();
@@ -803,11 +483,10 @@ impl Gateway {
             } // neural_guard dropped here
             
             // Send collected MaskUpdate packets (async, safe now)
-            for (packet, client_addr, session_id, new_mask) in pending_sends {
+            for (packet, client_addr) in pending_sends {
                 if let Err(e) = socket.send_to(&packet, client_addr).await {
                     warn!("Failed to send MaskUpdate to {}: {}", client_addr, e);
                 } else {
-                    sessions.update_session_mask(&session_id, new_mask);
                     info!("MaskUpdate control message sent to {}", client_addr);
                 }
             }
@@ -822,7 +501,6 @@ impl Gateway {
         socket: Arc<UdpSocket>,
         mask: MaskProfile,
         server_vpn_ip: Ipv4Addr,
-        recorder: Option<Arc<RecordingManager>>,
     ) {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
         let server_ip = server_vpn_ip;
@@ -859,22 +537,13 @@ impl Gateway {
                     
                     // Build encrypted response packet
                     // Minimize lock duration: extract only what we need under lock, then encrypt outside
-                    let (session_id, client_addr, downlink_iat_ms, tag, mdh, ciphertext) = {
+                    let (client_addr, _nonce, tag, mdh, ciphertext) = {
                         let mut sess = session.lock();
-                        let session_id = sess.session_id;
                         let client_addr = sess.client_addr;
                         let seq_num = sess.next_seq() as u16;
                         let (nonce, counter) = sess.next_send_nonce();
                         let key = sess.keys.session_key.clone();
                         let tag_secret = sess.keys.tag_secret;
-                        let downlink_iat_ms = sess.last_server_send.elapsed().as_secs_f64() * 1000.0;
-                        sess.last_server_send = Instant::now();
-                        // Use the session's own mask for MDH so the client can
-                        // decode with the mask it currently expects (bootstrap
-                        // or runtime after MaskUpdate is processed).
-                        let session_mdh = sess.mask.as_ref()
-                            .map(packet_mdh_bytes_for_mask)
-                            .unwrap_or_else(|| mask.header_template.clone());
                         drop(sess); // Release lock BEFORE expensive encryption
                         
                         // Build inner payload: Data type + IP packet
@@ -885,8 +554,8 @@ impl Gateway {
                         let mut inner_payload = inner_header.encode().to_vec();
                         inner_payload.extend_from_slice(packet);
                         
-                        // Build MDH using session mask (not global runtime mask)
-                        let mdh = session_mdh;
+                        // Build MDH (no eph_pub for data packets)
+                        let mdh = mask.header_template.clone();
                         
                         // Pad and encrypt (outside lock)
                         let pad_len: u16 = 0;
@@ -913,7 +582,7 @@ impl Gateway {
                             time_window,
                         );
                         
-                        (session_id, client_addr, downlink_iat_ms, tag, mdh, ciphertext)
+                        (client_addr, nonce, tag, mdh, ciphertext)
                     };
                     
                     // Assemble: TAG | MDH | ciphertext
@@ -925,21 +594,6 @@ impl Gateway {
                     // Send to client
                     if let Err(e) = socket.send_to(&aivpn_packet, client_addr).await {
                         debug!("TUN: send failed: {}", e);
-                    } else if let Some(ref recorder) = recorder {
-                        if recorder.is_recording(&session_id) {
-                            let meta = aivpn_common::recording::PacketMetadata {
-                                direction: aivpn_common::recording::Direction::Downlink,
-                                size: aivpn_packet.len() as u16,
-                                iat_ms: downlink_iat_ms,
-                                entropy: Self::compute_entropy(&ciphertext) as f32,
-                                header_prefix: aivpn_packet[TAG_SIZE..TAG_SIZE + 16.min(aivpn_packet.len() - TAG_SIZE)].to_vec(),
-                                timestamp_ns: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos() as u64,
-                            };
-                            recorder.record_packet(session_id, meta);
-                        }
                     }
                 }
                 Err(e) => {
@@ -1182,8 +836,8 @@ impl Gateway {
         let mut tag = [0u8; TAG_SIZE];
         tag.copy_from_slice(&packet_data[0..TAG_SIZE]);
         
-        // Default layout from runtime primary mask (used for handshake fallback).
-        let (catalog_mdh_len, catalog_hs_mdh_len, _eph_offset, _eph_len) = self.mask_catalog.packet_layout();
+        // O(1) tag validation - find session
+        let mdh_len = 4; // Default for MVP
         let mut is_new_session = false;
         let (session, counter, is_ratcheted_tag) = if let Some(session) = self.session_manager.get_session_by_tag(&tag) {
             // Existing session — validate tag
@@ -1209,86 +863,64 @@ impl Gateway {
             // Rate-limit failed handshake attempts to prevent rapid session-creation loops.
             // After mask rotation or session timeout, stale clients may flood the server
             // with packets that consistently fail tag validation (issue #21).
-            // TEMPORARILY DISABLED cooldown for debugging - client cannot handshake
-            // {
-            //     let ip = client_addr.ip();
-            //     if let Some(entry) = self.handshake_cooldowns.get(&ip) {
-            //         let (fail_count, last_fail) = *entry;
-            //         // Increased cooldown: start with 2s, max 30s to avoid blocking legitimate clients
-            //         let cooldown = Duration::from_millis(
-            //             (2000 * (1 << fail_count.min(3))) as u64
-            //         );
-            //         if last_fail.elapsed() < cooldown {
-            //             debug!("Handshake cooldown active for {}: fail_count={}, elapsed={:?}, cooldown={:?}",
-            //                 hash_addr(&client_addr), fail_count, last_fail.elapsed(), cooldown);
-            //             return Err(Error::InvalidPacket("Handshake cooldown active"));
-            //         } else {
-            //             debug!("Handshake cooldown expired for {}: elapsed={:?} >= cooldown={:?}",
-            //                 hash_addr(&client_addr), last_fail.elapsed(), cooldown);
-            //         }
-            //     }
-            // }
+            {
+                let ip = client_addr.ip();
+                if let Some(entry) = self.handshake_cooldowns.get(&ip) {
+                    let (fail_count, last_fail) = *entry;
+                    // Exponential cooldown: 1s for first failures, up to 5s after many
+                    let cooldown = Duration::from_millis(
+                        (250 * (1 << fail_count.min(4))) as u64
+                    );
+                    if last_fail.elapsed() < cooldown {
+                        return Err(Error::InvalidPacket("Handshake cooldown active"));
+                    }
+                }
+            }
 
-            // Try to establish a new session using one of the built-in bootstrap masks.
-            // Runtime masks can be server-generated, but bootstrap must remain compatible
-            // with clients that only know the shipped presets.
+            // Try to establish a new one from eph_pub in MDH
+            if packet_data.len() < TAG_SIZE + mdh_len + 32 {
+                return Err(Error::InvalidPacket("Too short for session init"));
+            }
+            let eph_start = TAG_SIZE + mdh_len;
+            if packet_data.len() < eph_start + 32 {
+                return Err(Error::InvalidPacket("Missing eph_pub for new session"));
+            }
+            let mut eph_pub = [0u8; 32];
+            eph_pub.copy_from_slice(&packet_data[eph_start..eph_start + 32]);
+            
+            // Deobfuscate eph_pub (HIGH-9)
+            crypto::obfuscate_eph_pub(&mut eph_pub, &self.session_manager.server_public_key());
+            
+            // Try to create session with each registered client's PSK.
             // If client_db is configured, iterate registered clients and try
             // DH + PSK to find one whose derived tags match.
             // Falls back to no-PSK for backward compatibility.
-            let builtin_bootstrap_masks = aivpn_common::mask::preset_masks::all();
-            let (session, matched_client_id, bootstrap_mask) = if let Some(ref db) = self.client_db {
+            let (session, matched_client_id) = if let Some(ref db) = self.client_db {
                 let clients = db.list_clients();
                 let mut found = None;
-                'bootstrap: for client_cfg in &clients {
-                    if !client_cfg.enabled {
-                        continue;
-                    }
-
+                for client_cfg in &clients {
+                    if !client_cfg.enabled { continue; }
                     let psk = client_cfg.psk;
-                    let candidate_masks = self.bootstrap_descriptors.iter()
-                        .flat_map(|descriptor| derive_bootstrap_candidates(descriptor, Some(&psk)))
-                        .chain(builtin_bootstrap_masks.clone().into_iter())
-                        .collect::<Vec<_>>();
-
-                    for bootstrap_mask in candidate_masks {
-                        let (_, candidate_handshake_mdh_len, candidate_eph_offset, candidate_eph_len) =
-                            packet_layout_for_mask(&bootstrap_mask);
-                        if packet_data.len() < TAG_SIZE + candidate_handshake_mdh_len {
-                            continue;
-                        }
-                        let eph_start = TAG_SIZE + candidate_eph_offset;
-                        if packet_data.len() < eph_start + candidate_eph_len {
-                            continue;
-                        }
-
-                        let mut eph_pub = [0u8; 32];
-                        eph_pub.copy_from_slice(&packet_data[eph_start..eph_start + candidate_eph_len]);
-                        crypto::obfuscate_eph_pub(&mut eph_pub, &self.session_manager.server_public_key());
-
-                        match self.session_manager.create_session(
-                            client_addr,
-                            eph_pub,
-                            Some(psk),
-                            Some(client_cfg.vpn_ip),
-                        ) {
-                            Ok(sess) => {
-                                let validation = sess.lock().validate_tag(&tag);
-                                if validation.is_some() {
-                                    debug!(
-                                        "Tag validation SUCCESS for client {} via bootstrap mask {}",
-                                        client_cfg.id,
-                                        bootstrap_mask.mask_id
-                                    );
-                                    found = Some((sess, Some(client_cfg.id.clone()), bootstrap_mask));
-                                    break 'bootstrap;
-                                }
+                    match self.session_manager.create_session(
+                        client_addr,
+                        eph_pub,
+                        Some(psk),
+                        Some(client_cfg.vpn_ip),
+                    ) {
+                        Ok(sess) => {
+                            let validation = sess.lock().validate_tag(&tag);
+                            if validation.is_some() {
+                                found = Some((sess, Some(client_cfg.id.clone())));
+                                break;
+                            } else {
+                                // PSK mismatch — rollback this attempt
                                 let sid = sess.lock().session_id;
                                 self.session_manager.rollback_failed_session(&sid);
                             }
-                            Err(e) => {
-                                debug!("create_session failed: {}", e);
-                                continue;
-                            }
+                        }
+                        Err(e) => {
+                            debug!("create_session failed: {}", e);
+                            continue;
                         }
                     }
                 }
@@ -1313,42 +945,13 @@ impl Gateway {
                 }
             } else {
                 // No client DB — legacy mode without PSK
-                let mut found = None;
-                let candidate_masks = self.bootstrap_descriptors.iter()
-                    .flat_map(|descriptor| derive_bootstrap_candidates(descriptor, None))
-                    .chain(builtin_bootstrap_masks.clone().into_iter())
-                    .collect::<Vec<_>>();
-                for bootstrap_mask in candidate_masks {
-                    let (_, candidate_handshake_mdh_len, candidate_eph_offset, candidate_eph_len) =
-                        packet_layout_for_mask(&bootstrap_mask);
-                    if packet_data.len() < TAG_SIZE + candidate_handshake_mdh_len {
-                        continue;
-                    }
-                    let eph_start = TAG_SIZE + candidate_eph_offset;
-                    if packet_data.len() < eph_start + candidate_eph_len {
-                        continue;
-                    }
-
-                    let mut eph_pub = [0u8; 32];
-                    eph_pub.copy_from_slice(&packet_data[eph_start..eph_start + candidate_eph_len]);
-                    crypto::obfuscate_eph_pub(&mut eph_pub, &self.session_manager.server_public_key());
-
-                    let sess = self.session_manager.create_session(
-                        client_addr,
-                        eph_pub,
-                        None,
-                        None,
-                    )?;
-                    let validation = sess.lock().validate_tag(&tag);
-                    if validation.is_some() {
-                        found = Some((sess, None, bootstrap_mask));
-                        break;
-                    }
-                    let sid = sess.lock().session_id;
-                    self.session_manager.rollback_failed_session(&sid);
-                }
-
-                found.ok_or_else(|| Error::InvalidPacket("No bootstrap mask matched this handshake"))?
+                let sess = self.session_manager.create_session(
+                    client_addr,
+                    eph_pub,
+                    None,
+                    None,
+                )?;
+                (sess, None)
             };
             
             // Validate the tag against the session.
@@ -1370,35 +973,20 @@ impl Gateway {
             // all sessions from this source IP — different clients behind
             // the same NAT must coexist.
             {
-                let (session_id, vpn_ip) = {
-                    let sess_lock = session.lock();
-                    (sess_lock.session_id, sess_lock.vpn_ip)
-                };
+                let sess_lock = session.lock();
+                let session_id = sess_lock.session_id;
+                let vpn_ip = sess_lock.vpn_ip;
+                drop(sess_lock);
                 if let Some(vpn_ip) = vpn_ip {
-                    let removed = self.session_manager.cleanup_old_sessions_for_vpn_ip(
+                    self.session_manager.cleanup_old_sessions_for_vpn_ip(
                         &vpn_ip,
                         &session_id,
                     );
-                    // Stop active recordings for removed stale sessions
-                    if let Some(ref recorder) = self.recording_manager {
-                        let socket = self.udp_socket.as_ref().unwrap().clone();
-                        let store = recorder.store();
-                        let mdh = self.mask_catalog.packet_mdh_bytes();
-                        for sid in removed {
-                            let outcome = recorder.stop_for_session_end(sid);
-                            Self::handle_recording_outcome(&socket, &self.session_manager, &store, &mdh, outcome, None).await;
-                        }
-                    }
                 }
             }
             
             // Successful handshake — clear cooldown for this IP
             self.handshake_cooldowns.remove(&client_addr.ip());
-
-            {
-                let mut sess = session.lock();
-                sess.mask = Some(bootstrap_mask.clone());
-            }
 
             // Record handshake in client DB
             if let (Some(ref db), Some(ref cid)) = (&self.client_db, &matched_client_id) {
@@ -1409,25 +997,6 @@ impl Gateway {
             }
             
             self.send_server_hello(&session, client_addr).await?;
-            self.send_bootstrap_descriptors(&session).await?;
-
-            if let Some(runtime_mask) = self.mask_catalog.primary_mask() {
-                if runtime_mask.mask_id != bootstrap_mask.mask_id {
-                    match self.session_manager.build_mask_update_packet(&session, &runtime_mask) {
-                        Ok(packet) => {
-                            self.udp_socket.as_ref().unwrap().send_to(&packet, client_addr).await?;
-                            // NOTE: Do NOT call update_session_mask here.
-                            // The client still sends packets with bootstrap mask layout
-                            // until it processes MaskUpdate. Keep sess.mask = bootstrap
-                            // so per-session decryption uses bootstrap layout, with
-                            // catalog (runtime) layout as fallback for transition.
-                        }
-                        Err(e) => {
-                            warn!("Failed to send initial runtime MaskUpdate: {}", e);
-                        }
-                    }
-                }
-            }
             
             // NOTE: PFS ratchet is deferred until AFTER decrypting the init packet,
             // which was encrypted with pre-ratchet keys.
@@ -1438,85 +1007,39 @@ impl Gateway {
         };
         
         // Parse packet — pad_len is inside encrypted area (CRIT-5 fix).
-        // Use the session's own mask layout for decryption. This is critical
-        // because the client may still be using its bootstrap mask before
-        // receiving and applying a MaskUpdate from the server.
-        // We try both the session mask layout AND the catalog (runtime) layout
-        // to handle the transition window.
-        let (session_mdh_len, session_hs_mdh_len) = {
-            let sess = session.lock();
-            if let Some(ref mask) = sess.mask {
-                let (p, h, _, _) = packet_layout_for_mask(mask);
-                (p, h)
-            } else {
-                (catalog_mdh_len, catalog_hs_mdh_len)
-            }
-        };
-        let packet_mdh_len = session_mdh_len;
-        let handshake_mdh_len = session_hs_mdh_len;
         // Android retransmits the initial handshake packet with the client
-        // eph_pub still embedded inside the MDH. Once a session already exists,
-        // those retries validate against the existing tag window, so the
-        // ciphertext still starts immediately after the full MDH.
+        // eph_pub still embedded before ciphertext. Once a session already
+        // exists, those retries validate against the existing tag window, so
+        // we must continue skipping eph_pub before decryption until ratchet
+        // completes.
         let is_pre_ratchet_retry = !is_new_session && !is_ratcheted_tag && {
             let sess = session.lock();
-            !sess.is_ratcheted && packet_data.len() >= TAG_SIZE + handshake_mdh_len + 16
+            !sess.is_ratcheted && packet_data.len() >= TAG_SIZE + mdh_len + 32 + 16
         };
-        let mut payload_offsets: Vec<usize> = if is_new_session {
-            vec![TAG_SIZE + handshake_mdh_len]
-        } else if is_pre_ratchet_retry && handshake_mdh_len != packet_mdh_len {
-            vec![TAG_SIZE + packet_mdh_len, TAG_SIZE + handshake_mdh_len]
+        let payload_offset = if is_new_session || is_pre_ratchet_retry {
+            TAG_SIZE + mdh_len + 32
         } else {
-            vec![TAG_SIZE + packet_mdh_len]
+            TAG_SIZE + mdh_len
         };
-        // During mask transition (bootstrap → runtime), also try the catalog
-        // (runtime) layout in case the client already applied MaskUpdate.
-        if catalog_mdh_len != session_mdh_len {
-            let catalog_offset = TAG_SIZE + catalog_mdh_len;
-            if !payload_offsets.contains(&catalog_offset) {
-                payload_offsets.push(catalog_offset);
-            }
+        if packet_data.len() <= payload_offset {
+            return Err(Error::InvalidPacket("Invalid length"));
         }
-
-        let (payload_offset, padded_plaintext) = {
+        
+        // Decrypt with appropriate keys (initial or ratcheted)
+        let encrypted_payload = &packet_data[payload_offset..];
+        
+        let padded_plaintext = {
             let sess = session.lock();
             let nonce = self.compute_nonce(counter);
-            // For new sessions, always use initial keys for decryption since the
-            // client hasn't received ServerHello yet and is still sending with
-            // initial keys. Only use ratcheted keys when the client proves it
-            // has switched by sending a ratcheted tag on an existing session.
-            let key = if is_new_session {
-                &sess.keys.session_key
-            } else if is_ratcheted_tag {
+            let key = if is_ratcheted_tag {
                 &sess.ratcheted_keys.as_ref()
                     .ok_or(Error::InvalidPacket("Ratcheted keys missing"))?
                     .session_key
             } else {
                 &sess.keys.session_key
             };
-
-            let mut decrypted = None;
-            let mut last_error = None;
-            for payload_offset in payload_offsets {
-                if packet_data.len() <= payload_offset {
-                    continue;
-                }
-                let encrypted_payload = &packet_data[payload_offset..];
-                match decrypt_payload(key, &nonce, encrypted_payload) {
-                    Ok(padded_plaintext) => {
-                        decrypted = Some((payload_offset, padded_plaintext));
-                        break;
-                    }
-                    Err(err) => last_error = Some(err),
-                }
-            }
-
-            match decrypted {
-                Some(result) => result,
-                None => return Err(last_error.unwrap_or_else(|| Error::InvalidPacket("Invalid length"))),
-            }
+            decrypt_payload(key, &nonce, encrypted_payload)?
         };
-        let encrypted_payload = &packet_data[payload_offset..];
         
         // Complete PFS ratchet only when the CLIENT proves it has ratcheted
         // by sending a packet with ratcheted-key tags.
@@ -1602,29 +1125,6 @@ impl Gateway {
                 );
             }
             self.metrics.record_packet_received(packet_data.len());
-        }
-
-        // Record uplink packet metadata for auto mask recording
-        if let Some(ref recorder) = self.recording_manager {
-            let session_id = session.lock().session_id;
-            if recorder.is_recording(&session_id) {
-                let iat_ms = {
-                    let sess = session.lock();
-                    sess.last_seen.elapsed().as_secs_f64() * 1000.0
-                };
-                let meta = aivpn_common::recording::PacketMetadata {
-                    direction: aivpn_common::recording::Direction::Uplink,
-                    size: packet_data.len() as u16,
-                    iat_ms,
-                    entropy: Self::compute_entropy(encrypted_payload) as f32,
-                    header_prefix: packet_data[TAG_SIZE..TAG_SIZE + 16.min(packet_data.len() - TAG_SIZE)].to_vec(),
-                    timestamp_ns: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64,
-                };
-                recorder.record_packet(session_id, meta);
-            }
         }
         
         // Record traffic in client DB in batches (see pending_bytes_in above).
@@ -1745,96 +1245,15 @@ impl Gateway {
             }
             ControlPayload::Shutdown { reason } => {
                 info!("Shutdown request from {} (reason: {})", hash_addr(&client_addr), reason);
-                // Close session and stop active recording if any
+                // Close session
                 let session_id = session.lock().session_id;
                 self.session_manager.remove_session(&session_id);
-                if let Some(ref recorder) = self.recording_manager {
-                    let socket = self.udp_socket.as_ref().unwrap().clone();
-                    let store = recorder.store();
-                    let mdh = self.mask_catalog.packet_mdh_bytes();
-                    let outcome = recorder.stop_for_session_end(session_id);
-                    Self::handle_recording_outcome(&socket, &self.session_manager, &store, &mdh, outcome, None).await;
-                }
             }
             ControlPayload::ControlAck { .. } => {
                 // ACK received, nothing to do
             }
             ControlPayload::ServerHello { .. } => {
                 warn!("Unexpected ServerHello from client {}", hash_addr(&client_addr));
-            }
-            ControlPayload::RecordingStart { service } => {
-                // Only allow from admin sessions (check client_id)
-                let admin_key_id = {
-                    let sess = session.lock();
-                    sess.client_id.clone()
-                };
-                if !self.can_start_recording(admin_key_id.as_deref()) {
-                    warn!("Recording rejected: unauthenticated client {}", hash_addr(&client_addr));
-                    let failed = ControlPayload::RecordingFailed {
-                        reason: "Recording requires a recording-admin key".into(),
-                    };
-                    self.send_control_message(&failed, session).await?;
-                    return Ok(());
-                }
-                if let Some(ref recorder) = self.recording_manager {
-                    let session_id = session.lock().session_id;
-                    recorder.start(session_id, service.clone(), admin_key_id.unwrap_or_else(|| "admin".into()));
-                    let ack = ControlPayload::RecordingAck {
-                        session_id,
-                        status: "started".into(),
-                    };
-                    self.send_control_message(&ack, session).await?;
-                    info!("Recording started for '{}' from {}", service, hash_addr(&client_addr));
-                }
-            }
-            ControlPayload::RecordingStop { session_id: rec_session_id } => {
-                if let Some(ref recorder) = self.recording_manager {
-                    let owner_session_id = session.lock().session_id;
-                    if rec_session_id != owner_session_id {
-                        let failed = ControlPayload::RecordingFailed {
-                            reason: "Recording session does not belong to this client".into(),
-                        };
-                        self.send_control_message(&failed, session).await?;
-                        return Ok(());
-                    }
-
-                    let socket = self.udp_socket.as_ref().unwrap().clone();
-                    let store = recorder.store();
-                    let mdh = self.mask_catalog.packet_mdh_bytes();
-                    let outcome = recorder.stop(owner_session_id);
-                    Self::handle_recording_outcome(&socket, &self.session_manager, &store, &mdh, outcome, Some(session.clone())).await;
-                }
-            }
-            ControlPayload::RecordingStatusRequest => {
-                let client_id = {
-                    let sess = session.lock();
-                    sess.client_id.clone()
-                };
-                let can_record = self.can_start_recording(client_id.as_deref());
-                let active_service = self.recording_manager
-                    .as_ref()
-                    .and_then(|recorder| recorder.status(&session.lock().session_id))
-                    .map(|status| status.service);
-                let response = ControlPayload::RecordingStatus {
-                    can_record,
-                    active_service,
-                };
-                self.send_control_message(&response, session).await?;
-            }
-            ControlPayload::RecordingAck { .. } => {
-                // Client-side only, ignore on server
-            }
-            ControlPayload::RecordingComplete { .. } => {
-                // Client-side only, ignore on server
-            }
-            ControlPayload::RecordingFailed { .. } => {
-                // Client-side only, ignore on server
-            }
-            ControlPayload::RecordingStatus { .. } => {
-                // Client-side only, ignore on server
-            }
-            ControlPayload::BootstrapDescriptorUpdate { .. } => {
-                // Client-side only, ignore on server
             }
         }
         
@@ -1848,63 +1267,24 @@ impl Gateway {
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<()> {
         let socket = self.udp_socket.as_ref().unwrap();
-        let mdh = {
-            let sess = session.lock();
-            sess.mask
-                .as_ref()
-                .map(packet_mdh_bytes_for_mask)
-                .unwrap_or_else(|| self.mask_catalog.packet_mdh_bytes())
-        };
-        Self::send_control_message_via(
-            socket,
-            &mdh,
-            payload,
-            session,
-        ).await
-    }
-
-    async fn send_control_message_via(
-        socket: &UdpSocket,
-        mdh: &[u8],
-        payload: &ControlPayload,
-        session: &Arc<parking_lot::Mutex<Session>>,
-    ) -> Result<()> {
+        
         let encoded = payload.encode()?;
-        let (mut inner_payload, nonce, counter, keys, client_addr) = {
+        let mut inner_payload = {
             let mut sess = session.lock();
             let inner_header = InnerHeader {
                 inner_type: InnerType::Control,
                 seq_num: sess.next_seq() as u16,
             };
-            let inner_payload = inner_header.encode().to_vec();
-            let (nonce, counter) = sess.next_send_nonce();
-            let keys = sess.keys.clone();
-            let client_addr = sess.client_addr;
-            (inner_payload, nonce, counter, keys, client_addr)
+            inner_header.encode().to_vec()
         };
         inner_payload.extend_from_slice(&encoded);
-        let pad_len = 16u16;
-        let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
-        padded.extend_from_slice(&pad_len.to_le_bytes());
-        padded.extend_from_slice(&inner_payload);
-        {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            for _ in 0..pad_len {
-                padded.push(rng.gen::<u8>());
-            }
-        }
-        let ciphertext = encrypt_payload(&keys.session_key, &nonce, &padded)?;
-        let time_window = crypto::compute_time_window(
-            crypto::current_timestamp_ms(),
-            aivpn_common::crypto::DEFAULT_WINDOW_MS,
-        );
-        let tag = crypto::generate_resonance_tag(&keys.tag_secret, counter, time_window);
-        let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(mdh);
-        packet.extend_from_slice(&ciphertext);
+        let packet = self.build_packet(&inner_payload, session)?;
+        
+        // Extract client_addr before dropping the guard to avoid holding
+        // MutexGuard across .await (which would cause deadlock)
+        let client_addr = session.lock().client_addr;
         socket.send_to(&packet, client_addr).await?;
+        
         Ok(())
     }
 
@@ -1981,15 +1361,9 @@ impl Gateway {
             counter,
             time_window,
         );
-        let current_mask = sess.mask.clone();
-        drop(sess);
-
-        // Build MDH using the session's current packet mask so the peer can
-        // decode bootstrap traffic before any runtime MaskUpdate arrives.
-        let mdh = current_mask
-            .as_ref()
-            .map(packet_mdh_bytes_for_mask)
-            .unwrap_or_else(|| self.mask_catalog.packet_mdh_bytes());
+        
+        // Build MDH (simple for MVP)
+        let mdh = vec![0u8; 4];
         
         // Assemble packet: TAG | MDH | ciphertext (no cleartext padding)
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
@@ -2028,41 +1402,5 @@ impl Gateway {
     /// Get metrics reference
     pub fn metrics(&self) -> &Arc<MetricsCollector> {
         &self.metrics
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MaskCatalog;
-    use aivpn_common::crypto::TAG_SIZE;
-    use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
-
-    #[test]
-    fn packet_layout_extracts_embedded_eph_pub_from_mdh() {
-        let catalog = MaskCatalog::new();
-        let mask = webrtc_zoom_v3();
-        catalog.register_mask(mask.clone());
-        catalog.set_primary_mask_id(mask.mask_id.clone());
-        let (packet_mdh_len, handshake_mdh_len, eph_offset, eph_len) = catalog.packet_layout();
-
-        let mut mdh = mask.header_template.clone();
-        if mdh.len() < handshake_mdh_len {
-            mdh.resize(handshake_mdh_len, 0);
-        }
-
-        let expected_eph = [0x5au8; 32];
-        mdh[eph_offset..eph_offset + eph_len].copy_from_slice(&expected_eph);
-
-        let mut packet = vec![0u8; TAG_SIZE];
-        packet.extend_from_slice(&mdh);
-        packet.extend_from_slice(&[0xabu8; 24]);
-
-        let eph_start = TAG_SIZE + eph_offset;
-        let payload_start = TAG_SIZE + handshake_mdh_len;
-
-        assert_eq!(packet_mdh_len, 20, "regular STUN packet MDH length must stay at 20 bytes");
-        assert_eq!(handshake_mdh_len, 52, "handshake MDH length must include embedded eph_pub");
-        assert_eq!(&packet[eph_start..eph_start + eph_len], &expected_eph);
-        assert_eq!(&packet[payload_start..], &[0xabu8; 24]);
     }
 }

@@ -1,0 +1,10 @@
+{
+  "connection_key": "aivpn://YOUR_CONNECTION_KEY",
+  "mode": "socks5",
+  "local_socks5": {
+    "host": "127.0.0.1",
+    "port": 1080,
+    "max_clients": 256,
+    "max_concurrent_dials": 128
+  }
+}
