@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
@@ -118,6 +118,8 @@ pub struct LocalSocks5Runtime {
     dial_slots: Arc<Semaphore>,
     max_concurrent_dials: usize,
     next_session_id: portable_atomic::AtomicU64,
+    generation: portable_atomic::AtomicU64,
+    reset_notify: Notify,
 }
 
 #[derive(Debug)]
@@ -142,6 +144,8 @@ impl LocalSocks5Runtime {
             dial_slots: Arc::new(Semaphore::new(max_concurrent_dials)),
             max_concurrent_dials,
             next_session_id: portable_atomic::AtomicU64::new(1),
+            generation: portable_atomic::AtomicU64::new(1),
+            reset_notify: Notify::new(),
         }
     }
 
@@ -171,6 +175,10 @@ impl LocalSocks5Runtime {
         self.next_session_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     pub fn available_dial_slots(&self) -> usize {
         self.dial_slots.available_permits()
     }
@@ -179,12 +187,35 @@ impl LocalSocks5Runtime {
         self.max_concurrent_dials
     }
 
-    pub async fn acquire_dial_slot(&self) -> Result<OwnedSemaphorePermit> {
-        self.dial_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Session("Local SOCKS5 dial queue is shutting down".into()))
+    pub fn reset_active_sessions(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.reset_notify.notify_waiters();
+    }
+
+    pub async fn wait_for_generation_change(&self, generation: u64) {
+        loop {
+            let notified = self.reset_notify.notified();
+            if self.current_generation() != generation {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn acquire_dial_slot(&self, generation: u64) -> Result<OwnedSemaphorePermit> {
+        if self.current_generation() != generation {
+            return Err(Error::Session(
+                "Local SOCKS5 dial cancelled by tunnel reset".into(),
+            ));
+        }
+
+        tokio::select! {
+            permit = self.dial_slots.clone().acquire_owned() => permit
+                .map_err(|_| Error::Session("Local SOCKS5 dial queue is shutting down".into())),
+            _ = self.wait_for_generation_change(generation) => Err(Error::Session(
+                "Local SOCKS5 dial cancelled by tunnel reset".into(),
+            )),
+        }
     }
 }
 
@@ -313,13 +344,30 @@ async fn handle_client(
             )));
         }
     };
+    let session_generation = runtime.current_generation();
 
     match command {
         SOCKS5_CMD_CONNECT => {
-            handle_connect(&mut client, target, peer_addr, runtime, session_id).await
+            handle_connect(
+                &mut client,
+                target,
+                peer_addr,
+                runtime,
+                session_id,
+                session_generation,
+            )
+            .await
         }
         SOCKS5_CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(&mut client, target, peer_addr, runtime, session_id).await
+            handle_udp_associate(
+                &mut client,
+                target,
+                peer_addr,
+                runtime,
+                session_id,
+                session_generation,
+            )
+            .await
         }
         _ => {
             let reply_addr = unspecified_addr_for_peer(peer_addr);
@@ -393,6 +441,7 @@ async fn handle_connect(
     peer_addr: SocketAddr,
     runtime: Arc<LocalSocks5Runtime>,
     session_id: u64,
+    session_generation: u64,
 ) -> Result<()> {
     let target_display = target.display();
     debug!(
@@ -410,7 +459,7 @@ async fn handle_connect(
 
     let queue_started = Instant::now();
     let available_before_queue = runtime.available_dial_slots();
-    let dial_permit = runtime.acquire_dial_slot().await?;
+    let dial_permit = runtime.acquire_dial_slot(session_generation).await?;
     let queue_wait = queue_started.elapsed();
     if queue_wait >= LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD || available_before_queue == 0 {
         info!(
@@ -424,7 +473,7 @@ async fn handle_connect(
     }
 
     let dial_started = Instant::now();
-    match connect_target(target.clone(), runtime).await {
+    match connect_target(target.clone(), runtime.clone(), session_generation).await {
         Ok(connect_res) => {
             let mut upstream = connect_res.stream;
             let dial_elapsed = dial_started.elapsed();
@@ -450,10 +499,19 @@ async fn handle_connect(
             // `max_clients`, so release the dial slot before starting relay I/O.
             drop(dial_permit);
             send_reply(client, SOCKS5_REPLY_SUCCEEDED, bind_addr).await?;
-            let _ = copy_bidirectional(client, &mut upstream)
-                .await
-                .map_err(Error::Io)?;
-            Ok(())
+            tokio::select! {
+                relay_res = copy_bidirectional(client, &mut upstream) => {
+                    let _ = relay_res.map_err(Error::Io)?;
+                    Ok(())
+                }
+                _ = runtime.wait_for_generation_change(session_generation) => {
+                    let _ = upstream.shutdown().await;
+                    let _ = client.shutdown().await;
+                    Err(Error::Session(
+                        "AIVPN tunnel reset during local SOCKS5 relay".into(),
+                    ))
+                }
+            }
         }
         Err(connect_err) => {
             let dial_elapsed = dial_started.elapsed();
@@ -482,6 +540,7 @@ async fn handle_udp_associate(
     peer_addr: SocketAddr,
     runtime: Arc<LocalSocks5Runtime>,
     session_id: u64,
+    session_generation: u64,
 ) -> Result<()> {
     debug!(
         "Local SOCKS5 session #{} UDP ASSOCIATE {} -> {}",
@@ -523,6 +582,11 @@ async fn handle_udp_associate(
 
     loop {
         tokio::select! {
+            _ = runtime.wait_for_generation_change(session_generation) => {
+                return Err(Error::Session(
+                    "AIVPN tunnel reset during local SOCKS5 UDP relay".into(),
+                ));
+            }
             control_res = client.read(&mut control_buf) => {
                 match control_res {
                     Ok(0) => break,
@@ -583,6 +647,7 @@ fn is_nonblocking_connect_in_progress(err: &io::Error) -> bool {
 async fn connect_target(
     target: TargetAddr,
     runtime: Arc<LocalSocks5Runtime>,
+    generation: u64,
 ) -> std::result::Result<ConnectTargetSuccess, ConnectTargetFailure> {
     let target_addr = match &target {
         TargetAddr::Socket(addr) => *addr,
@@ -647,7 +712,14 @@ async fn connect_target(
     })?;
 
     let connect_wait_started = Instant::now();
-    timeout(LOCAL_SOCKS5_CONNECT_TIMEOUT, stream.writable())
+    let connect_wait_result: Result<()> = timeout(LOCAL_SOCKS5_CONNECT_TIMEOUT, async {
+        tokio::select! {
+            writable_res = stream.writable() => writable_res.map_err(Error::Io),
+            _ = runtime.wait_for_generation_change(generation) => Err(Error::Session(
+                "Local SOCKS5 dial cancelled by tunnel reset".into(),
+            )),
+        }
+    })
         .await
         .map_err(|_| ConnectTargetFailure {
             error: Error::Io(io::Error::new(
@@ -660,9 +732,9 @@ async fn connect_target(
             )),
             setup_elapsed,
             connect_wait_elapsed: LOCAL_SOCKS5_CONNECT_TIMEOUT,
-        })?
-        .map_err(|err| ConnectTargetFailure {
-            error: Error::Io(err),
+        })?;
+    connect_wait_result.map_err(|error| ConnectTargetFailure {
+            error,
             setup_elapsed,
             connect_wait_elapsed: connect_wait_started.elapsed(),
         })?;
@@ -901,6 +973,13 @@ fn map_error_to_reply(err: &Error) -> u8 {
         },
         Error::Session(message) if message.contains("address type") => {
             SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
+        }
+        Error::Session(message)
+            if message.contains("tunnel")
+                || message.contains("namespace")
+                || message.contains("reset") =>
+        {
+            SOCKS5_REPLY_NETWORK_UNREACHABLE
         }
         _ => SOCKS5_REPLY_GENERAL_FAILURE,
     }

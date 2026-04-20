@@ -267,6 +267,7 @@ impl AivpnClient {
         self.udp_socket = None;
         if let Some(runtime) = &self.config.local_socks5_runtime {
             runtime.set_ready(false);
+            runtime.reset_active_sessions();
             runtime.set_namespace(None);
         }
         self.socks_namespace = None;
@@ -444,6 +445,7 @@ impl AivpnClient {
                     if inactive_for_ms >= SERVER_INACTIVITY_TIMEOUT.as_millis() as u64 {
                         if let Some(runtime) = &self.config.local_socks5_runtime {
                             runtime.set_ready(false);
+                            runtime.reset_active_sessions();
                         }
                         warn!(
                             "No inbound packets from server for {}s; reconnecting client session",
