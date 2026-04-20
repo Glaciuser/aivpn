@@ -1,3 +1,5 @@
+## [EN](README.md) | [RU](README_RU.md)
+
 # AIVPN + SOCKS5
 
 Traditional VPNs are dead. ISPs and state-level firewalls (like GFW) detect WireGuard and OpenVPN in milliseconds just by looking at packet sizes, timing intervals, and handshake patterns. You can encrypt your payload with whatever cipher you want — DPI systems don't care about the content, they block the *shape* of the connection itself.
