@@ -221,7 +221,12 @@ async fn main() {
     };
 
     let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
+    let max_backoff = if settings.mode == RuntimeMode::Socks5 {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(60)
+    };
+    let mut reconnect_attempt: u32 = 0;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -263,18 +268,26 @@ async fn main() {
 
                 match client.run(shutdown.clone()).await {
                     Ok(()) => break,
-                    Err(err) => warn!(
-                        "Client run failed: {}. Reconnecting in {}s",
-                        err,
-                        backoff.as_secs()
-                    ),
+                    Err(err) => {
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        warn!(
+                            "Client run failed: {}. Reconnect attempt #{} in {}s",
+                            err,
+                            reconnect_attempt,
+                            backoff.as_secs()
+                        );
+                    }
                 }
             }
-            Err(err) => error!(
-                "Failed to create client: {}. Reconnecting in {}s",
-                err,
-                backoff.as_secs()
-            ),
+            Err(err) => {
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                error!(
+                    "Failed to create client: {}. Reconnect attempt #{} in {}s",
+                    err,
+                    reconnect_attempt,
+                    backoff.as_secs()
+                );
+            }
         }
 
         if shutdown.load(Ordering::SeqCst) {

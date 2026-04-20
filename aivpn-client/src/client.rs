@@ -440,6 +440,20 @@ impl AivpnClient {
                         break Ok(());
                     }
 
+                    if let Some(runtime) = &self.config.local_socks5_runtime {
+                        if let Some(reason) = runtime.take_forced_reconnect_reason() {
+                            warn!(
+                                "Local SOCKS5 requested an immediate client reconnect: {}",
+                                reason
+                            );
+                            stats_task.abort();
+                            break Err(Error::Session(format!(
+                                "Local SOCKS5 requested reconnect: {}",
+                                reason
+                            )));
+                        }
+                    }
+
                     let inactive_for_ms = crypto::current_timestamp_ms()
                         .saturating_sub(last_server_packet_at.load(Ordering::Relaxed));
                     if inactive_for_ms >= SERVER_INACTIVITY_TIMEOUT.as_millis() as u64 {

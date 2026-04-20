@@ -1,6 +1,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -37,6 +38,11 @@ const LOCAL_SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const LOCAL_SOCKS5_SLOW_CONNECT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+const LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD: u32 = 8;
+const LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW: Duration = Duration::from_secs(10);
+const LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD: u32 = 4;
+const LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
+const LOCAL_SOCKS5_UNAVAILABLE_LOG_THROTTLE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalSocks5Config {
@@ -120,6 +126,17 @@ pub struct LocalSocks5Runtime {
     next_session_id: portable_atomic::AtomicU64,
     generation: portable_atomic::AtomicU64,
     reset_notify: Notify,
+    diagnostics: Mutex<LocalSocks5Diagnostics>,
+}
+
+#[derive(Debug, Default)]
+struct LocalSocks5Diagnostics {
+    ready_network_unreachable_streak: u32,
+    ready_window_started_at: Option<Instant>,
+    ready_timeout_streak: u32,
+    ready_timeout_window_started_at: Option<Instant>,
+    pending_forced_reconnect_reason: Option<String>,
+    last_unavailable_log_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -146,6 +163,7 @@ impl LocalSocks5Runtime {
             next_session_id: portable_atomic::AtomicU64::new(1),
             generation: portable_atomic::AtomicU64::new(1),
             reset_notify: Notify::new(),
+            diagnostics: Mutex::new(LocalSocks5Diagnostics::default()),
         }
     }
 
@@ -155,6 +173,13 @@ impl LocalSocks5Runtime {
 
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::SeqCst);
+        if ready {
+            self.clear_connectivity_failure_streak();
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                diagnostics.pending_forced_reconnect_reason = None;
+                diagnostics.last_unavailable_log_at = None;
+            }
+        }
     }
 
     pub fn set_namespace(&self, namespace: Option<Arc<NetworkNamespace>>) {
@@ -190,6 +215,177 @@ impl LocalSocks5Runtime {
     pub fn reset_active_sessions(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.reset_notify.notify_waiters();
+    }
+
+    pub fn clear_connectivity_failure_streak(&self) {
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.ready_network_unreachable_streak = 0;
+            diagnostics.ready_window_started_at = None;
+            diagnostics.ready_timeout_streak = 0;
+            diagnostics.ready_timeout_window_started_at = None;
+        }
+    }
+
+    pub fn take_forced_reconnect_reason(&self) -> Option<String> {
+        self.diagnostics
+            .lock()
+            .ok()
+            .and_then(|mut diagnostics| diagnostics.pending_forced_reconnect_reason.take())
+    }
+
+    pub fn observe_network_unreachable_reply(
+        &self,
+        target_display: &str,
+        peer_addr: SocketAddr,
+        detail: &str,
+    ) {
+        let ready = self.is_ready();
+        let now = Instant::now();
+        let mut streak_to_log = None;
+        let mut should_log_unavailable = false;
+        let mut forced_reason = None;
+
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            if !ready {
+                let should_refresh = match diagnostics.last_unavailable_log_at {
+                    Some(last_log_at) => {
+                        now.duration_since(last_log_at) >= LOCAL_SOCKS5_UNAVAILABLE_LOG_THROTTLE
+                    }
+                    None => true,
+                };
+                if should_refresh {
+                    diagnostics.last_unavailable_log_at = Some(now);
+                    should_log_unavailable = true;
+                }
+            } else {
+                let reset_window = match diagnostics.ready_window_started_at {
+                    Some(started_at) => {
+                        now.duration_since(started_at) >= LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW
+                    }
+                    None => true,
+                };
+                if reset_window {
+                    diagnostics.ready_window_started_at = Some(now);
+                    diagnostics.ready_network_unreachable_streak = 0;
+                }
+
+                diagnostics.ready_network_unreachable_streak += 1;
+                let streak = diagnostics.ready_network_unreachable_streak;
+                if streak == 1 || streak == (LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD / 2) {
+                    streak_to_log = Some(streak);
+                }
+
+                if streak >= LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD
+                    && diagnostics.pending_forced_reconnect_reason.is_none()
+                {
+                    let reason = format!(
+                        "local SOCKS5 saw {streak} consecutive network-unreachable replies within {}s; last target {} from {} ({detail})",
+                        LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW.as_secs(),
+                        target_display,
+                        peer_addr
+                    );
+                    diagnostics.pending_forced_reconnect_reason = Some(reason.clone());
+                    forced_reason = Some(reason);
+                }
+            }
+        }
+
+        if should_log_unavailable {
+            warn!(
+                "Local SOCKS5 rejected {} from {} with network unreachable because the AIVPN tunnel is not ready: {}",
+                target_display,
+                peer_addr,
+                detail
+            );
+            return;
+        }
+
+        if let Some(streak) = streak_to_log {
+            warn!(
+                "Local SOCKS5 returned network unreachable for {} from {} while the dataplane was marked ready (streak {}/{}): {}",
+                target_display,
+                peer_addr,
+                streak,
+                LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD,
+                detail
+            );
+        }
+
+        if let Some(reason) = forced_reason {
+            self.ready.store(false, Ordering::SeqCst);
+            self.reset_active_sessions();
+            warn!(
+                "Local SOCKS5 forced an AIVPN reconnect after repeated network-unreachable replies: {}",
+                reason
+            );
+        }
+    }
+
+    pub fn observe_connect_timeout(
+        &self,
+        target_display: &str,
+        peer_addr: SocketAddr,
+        detail: &str,
+    ) {
+        if !self.is_ready() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut streak_to_log = None;
+        let mut forced_reason = None;
+
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            let reset_window = match diagnostics.ready_timeout_window_started_at {
+                Some(started_at) => {
+                    now.duration_since(started_at) >= LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW
+                }
+                None => true,
+            };
+            if reset_window {
+                diagnostics.ready_timeout_window_started_at = Some(now);
+                diagnostics.ready_timeout_streak = 0;
+            }
+
+            diagnostics.ready_timeout_streak += 1;
+            let streak = diagnostics.ready_timeout_streak;
+            if streak == 1 || streak == (LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD / 2) {
+                streak_to_log = Some(streak);
+            }
+
+            if streak >= LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD
+                && diagnostics.pending_forced_reconnect_reason.is_none()
+            {
+                let reason = format!(
+                    "local SOCKS5 saw {streak} dial timeouts within {}s while marked ready; last target {} from {} ({detail})",
+                    LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW.as_secs(),
+                    target_display,
+                    peer_addr
+                );
+                diagnostics.pending_forced_reconnect_reason = Some(reason.clone());
+                forced_reason = Some(reason);
+            }
+        }
+
+        if let Some(streak) = streak_to_log {
+            warn!(
+                "Local SOCKS5 dial to {} from {} timed out while the dataplane was marked ready (streak {}/{}): {}",
+                target_display,
+                peer_addr,
+                streak,
+                LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
+                detail
+            );
+        }
+
+        if let Some(reason) = forced_reason {
+            self.ready.store(false, Ordering::SeqCst);
+            self.reset_active_sessions();
+            warn!(
+                "Local SOCKS5 forced an AIVPN reconnect after repeated dial timeouts: {}",
+                reason
+            );
+        }
     }
 
     pub async fn wait_for_generation_change(&self, generation: u64) {
@@ -450,6 +646,11 @@ async fn handle_connect(
     );
 
     if !runtime.is_ready() {
+        runtime.observe_network_unreachable_reply(
+            &target_display,
+            peer_addr,
+            "AIVPN tunnel is reconnecting or not ready yet",
+        );
         let reply_addr = unspecified_addr_for_peer(peer_addr);
         send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
         return Err(Error::Session(
@@ -478,6 +679,7 @@ async fn handle_connect(
             let mut upstream = connect_res.stream;
             let dial_elapsed = dial_started.elapsed();
             let bind_addr = upstream.local_addr().map_err(Error::Io)?;
+            runtime.clear_connectivity_failure_streak();
             if dial_elapsed >= LOCAL_SOCKS5_SLOW_CONNECT_LOG_THRESHOLD
                 || queue_wait >= LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD
             {
@@ -518,6 +720,20 @@ async fn handle_connect(
             let reply = map_error_to_reply(&connect_err.error);
             let reply_addr = unspecified_addr_for_peer(peer_addr);
             let _ = send_reply(client, reply, reply_addr).await;
+            if matches!(&connect_err.error, Error::Io(io_err) if io_err.kind() == io::ErrorKind::TimedOut) {
+                runtime.observe_connect_timeout(
+                    &target_display,
+                    peer_addr,
+                    &connect_err.error.to_string(),
+                );
+            }
+            if reply == SOCKS5_REPLY_NETWORK_UNREACHABLE {
+                runtime.observe_network_unreachable_reply(
+                    &target_display,
+                    peer_addr,
+                    &connect_err.error.to_string(),
+                );
+            }
             warn!(
                 "Local SOCKS5 session #{} failed dialing {} after queue {:?} and dial {:?} (setup {:?}, connect wait {:?}): {}",
                 session_id,
@@ -542,14 +758,20 @@ async fn handle_udp_associate(
     session_id: u64,
     session_generation: u64,
 ) -> Result<()> {
+    let target_display = target.display();
     debug!(
         "Local SOCKS5 session #{} UDP ASSOCIATE {} -> {}",
         session_id,
         peer_addr,
-        target.display()
+        target_display
     );
 
     if !runtime.is_ready() {
+        runtime.observe_network_unreachable_reply(
+            &target_display,
+            peer_addr,
+            "AIVPN tunnel is reconnecting or not ready yet",
+        );
         let reply_addr = unspecified_addr_for_peer(peer_addr);
         send_reply(client, SOCKS5_REPLY_NETWORK_UNREACHABLE, reply_addr).await?;
         return Err(Error::Session(
@@ -607,6 +829,11 @@ async fn handle_udp_associate(
                 }
 
                 if !runtime.is_ready() {
+                    runtime.observe_network_unreachable_reply(
+                        &target_display,
+                        peer_addr,
+                        "AIVPN tunnel became unavailable during UDP relay",
+                    );
                     return Err(Error::Session(
                         "AIVPN tunnel unavailable for local SOCKS5 UDP relay".into(),
                     ));
@@ -1021,5 +1248,60 @@ mod tests {
         };
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_forces_reconnect_after_ready_network_unreachable_burst() {
+        let runtime = LocalSocks5Runtime::new(1);
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        runtime.set_ready(true);
+
+        for _ in 0..LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
+            runtime.observe_network_unreachable_reply(
+                "149.154.167.50:443",
+                peer_addr,
+                "simulated failure",
+            );
+        }
+
+        let reason = runtime.take_forced_reconnect_reason();
+        assert!(reason.is_some());
+        assert!(!runtime.is_ready());
+    }
+
+    #[test]
+    fn runtime_does_not_force_reconnect_while_not_ready() {
+        let runtime = LocalSocks5Runtime::new(1);
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        runtime.set_ready(false);
+
+        for _ in 0..LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
+            runtime.observe_network_unreachable_reply(
+                "149.154.167.50:443",
+                peer_addr,
+                "simulated reconnect",
+            );
+        }
+
+        assert!(runtime.take_forced_reconnect_reason().is_none());
+    }
+
+    #[test]
+    fn runtime_forces_reconnect_after_ready_timeout_burst() {
+        let runtime = LocalSocks5Runtime::new(1);
+        let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        runtime.set_ready(true);
+
+        for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+            runtime.observe_connect_timeout(
+                "8.8.4.4:443",
+                peer_addr,
+                "simulated timeout",
+            );
+        }
+
+        let reason = runtime.take_forced_reconnect_reason();
+        assert!(reason.is_some());
+        assert!(!runtime.is_ready());
     }
 }
