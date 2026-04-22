@@ -34,6 +34,27 @@ require_command() {
     fi
 }
 
+is_msys_shell() {
+    [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* || "${MSYSTEM:-}" == MINGW* || "${MSYSTEM:-}" == MSYS* ]]
+}
+
+docker_host_path() {
+    local path="$1"
+    if is_msys_shell && command -v cygpath >/dev/null 2>&1; then
+        cygpath -am "$path"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+docker_cmd() {
+    if is_msys_shell; then
+        MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker "$@"
+    else
+        docker "$@"
+    fi
+}
+
 case "$PACKAGE_KIND" in
     server)
         CRATE_NAME="aivpn-server"
@@ -68,14 +89,7 @@ esac
 
 require_command docker
 
-IMAGE_NAME="aivpn-${BINARY_NAME}-${TARGET//[^a-zA-Z0-9]/-}:musl-release"
-CONTAINER_NAME="aivpn-${BINARY_NAME}-${TARGET//[^a-zA-Z0-9]/-}-$RANDOM-$RANDOM"
-
-cleanup() {
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-}
-
-trap cleanup EXIT
+DOCKER_SRC_DIR="$(docker_host_path "$SCRIPT_DIR")"
 
 echo "=== Building ${BINARY_NAME} for ${TARGET} (musl static) ==="
 echo ""
@@ -83,35 +97,13 @@ echo "Using Docker image: messense/rust-musl-cross:${IMAGE_TAG}"
 
 mkdir -p releases
 
-docker build \
-    --build-arg MUSL_IMAGE_TAG="$IMAGE_TAG" \
-    --build-arg TARGET_TRIPLE="$TARGET" \
-    --build-arg CRATE_NAME="$CRATE_NAME" \
-    --build-arg BINARY_NAME="$BINARY_NAME" \
-    -t "$IMAGE_NAME" \
-    -f - \
-    . <<'EOF'
-ARG MUSL_IMAGE_TAG
-FROM messense/rust-musl-cross:${MUSL_IMAGE_TAG} AS builder
+docker_cmd run --rm \
+    -v "${DOCKER_SRC_DIR}:/app" \
+    -w /app \
+    "messense/rust-musl-cross:${IMAGE_TAG}" \
+    cargo build --release --target "$TARGET" -p "$CRATE_NAME" --bin "$BINARY_NAME"
 
-ARG TARGET_TRIPLE
-ARG CRATE_NAME
-ARG BINARY_NAME
-
-WORKDIR /app
-
-COPY Cargo.toml ./
-COPY aivpn-common aivpn-common/
-COPY aivpn-server aivpn-server/
-COPY aivpn-client aivpn-client/
-COPY aivpn-android-core aivpn-android-core/
-COPY aivpn-windows aivpn-windows/
-
-RUN cargo build --release --target "$TARGET_TRIPLE" -p "$CRATE_NAME" --bin "$BINARY_NAME"
-EOF
-
-docker create --name "$CONTAINER_NAME" "$IMAGE_NAME" >/dev/null
-docker cp "$CONTAINER_NAME:/app/target/${TARGET}/release/${BINARY_NAME}" "$ARTIFACT_PATH"
+cp "target/${TARGET}/release/${BINARY_NAME}" "$ARTIFACT_PATH"
 chmod +x "$ARTIFACT_PATH"
 
 echo ""

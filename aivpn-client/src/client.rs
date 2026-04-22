@@ -37,8 +37,8 @@ use crate::local_socks::LocalSocks5Runtime;
 use crate::netns::NetworkNamespace;
 use crate::tunnel::{Tunnel, TunnelConfig};
 
-const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const SERVER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientMode {
@@ -438,20 +438,6 @@ impl AivpnClient {
                         info!("Shutdown requested");
                         stats_task.abort();
                         break Ok(());
-                    }
-
-                    if let Some(runtime) = &self.config.local_socks5_runtime {
-                        if let Some(reason) = runtime.take_forced_reconnect_reason() {
-                            warn!(
-                                "Local SOCKS5 requested an immediate client reconnect: {}",
-                                reason
-                            );
-                            stats_task.abort();
-                            break Err(Error::Session(format!(
-                                "Local SOCKS5 requested reconnect: {}",
-                                reason
-                            )));
-                        }
                     }
 
                     let inactive_for_ms = crypto::current_timestamp_ms()

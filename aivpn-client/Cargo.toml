@@ -25,6 +25,7 @@ tokio-util.workspace = true
 # Networking - use latest tun with async support
 tun = { version = "0.7", features = ["async"] }
 socket2.workspace = true
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 # Serialization
 serde.workspace = true

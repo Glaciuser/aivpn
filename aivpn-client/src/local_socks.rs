@@ -6,11 +6,11 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant as TokioInstant, sleep, sleep_until, timeout};
 use tracing::{debug, info, warn};
 
 use aivpn_common::error::{Error, Result};
@@ -38,6 +38,8 @@ const LOCAL_SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOCKS5_QUEUE_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const LOCAL_SOCKS5_SLOW_CONNECT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+const LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD: u32 = 8;
 const LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 const LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD: u32 = 4;
@@ -135,7 +137,6 @@ struct LocalSocks5Diagnostics {
     ready_window_started_at: Option<Instant>,
     ready_timeout_streak: u32,
     ready_timeout_window_started_at: Option<Instant>,
-    pending_forced_reconnect_reason: Option<String>,
     last_unavailable_log_at: Option<Instant>,
 }
 
@@ -176,7 +177,6 @@ impl LocalSocks5Runtime {
         if ready {
             self.clear_connectivity_failure_streak();
             if let Ok(mut diagnostics) = self.diagnostics.lock() {
-                diagnostics.pending_forced_reconnect_reason = None;
                 diagnostics.last_unavailable_log_at = None;
             }
         }
@@ -226,13 +226,6 @@ impl LocalSocks5Runtime {
         }
     }
 
-    pub fn take_forced_reconnect_reason(&self) -> Option<String> {
-        self.diagnostics
-            .lock()
-            .ok()
-            .and_then(|mut diagnostics| diagnostics.pending_forced_reconnect_reason.take())
-    }
-
     pub fn observe_network_unreachable_reply(
         &self,
         target_display: &str,
@@ -243,7 +236,6 @@ impl LocalSocks5Runtime {
         let now = Instant::now();
         let mut streak_to_log = None;
         let mut should_log_unavailable = false;
-        let mut forced_reason = None;
 
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             if !ready {
@@ -271,21 +263,11 @@ impl LocalSocks5Runtime {
 
                 diagnostics.ready_network_unreachable_streak += 1;
                 let streak = diagnostics.ready_network_unreachable_streak;
-                if streak == 1 || streak == (LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD / 2) {
-                    streak_to_log = Some(streak);
-                }
-
-                if streak >= LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD
-                    && diagnostics.pending_forced_reconnect_reason.is_none()
+                if streak == 1
+                    || streak == (LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD / 2)
+                    || streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD
                 {
-                    let reason = format!(
-                        "local SOCKS5 saw {streak} consecutive network-unreachable replies within {}s; last target {} from {} ({detail})",
-                        LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW.as_secs(),
-                        target_display,
-                        peer_addr
-                    );
-                    diagnostics.pending_forced_reconnect_reason = Some(reason.clone());
-                    forced_reason = Some(reason);
+                    streak_to_log = Some(streak);
                 }
             }
         }
@@ -310,15 +292,6 @@ impl LocalSocks5Runtime {
                 detail
             );
         }
-
-        if let Some(reason) = forced_reason {
-            self.ready.store(false, Ordering::SeqCst);
-            self.reset_active_sessions();
-            warn!(
-                "Local SOCKS5 forced an AIVPN reconnect after repeated network-unreachable replies: {}",
-                reason
-            );
-        }
     }
 
     pub fn observe_connect_timeout(
@@ -333,7 +306,6 @@ impl LocalSocks5Runtime {
 
         let now = Instant::now();
         let mut streak_to_log = None;
-        let mut forced_reason = None;
 
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             let reset_window = match diagnostics.ready_timeout_window_started_at {
@@ -349,21 +321,11 @@ impl LocalSocks5Runtime {
 
             diagnostics.ready_timeout_streak += 1;
             let streak = diagnostics.ready_timeout_streak;
-            if streak == 1 || streak == (LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD / 2) {
-                streak_to_log = Some(streak);
-            }
-
-            if streak >= LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD
-                && diagnostics.pending_forced_reconnect_reason.is_none()
+            if streak == 1
+                || streak == (LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD / 2)
+                || streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD
             {
-                let reason = format!(
-                    "local SOCKS5 saw {streak} dial timeouts within {}s while marked ready; last target {} from {} ({detail})",
-                    LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW.as_secs(),
-                    target_display,
-                    peer_addr
-                );
-                diagnostics.pending_forced_reconnect_reason = Some(reason.clone());
-                forced_reason = Some(reason);
+                streak_to_log = Some(streak);
             }
         }
 
@@ -375,15 +337,6 @@ impl LocalSocks5Runtime {
                 streak,
                 LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
                 detail
-            );
-        }
-
-        if let Some(reason) = forced_reason {
-            self.ready.store(false, Ordering::SeqCst);
-            self.reset_active_sessions();
-            warn!(
-                "Local SOCKS5 forced an AIVPN reconnect after repeated dial timeouts: {}",
-                reason
             );
         }
     }
@@ -503,6 +456,7 @@ fn is_benign_client_disconnect(err: &Error) -> bool {
                 | io::ErrorKind::BrokenPipe
                 | io::ErrorKind::UnexpectedEof
         ),
+        Error::Session(message) if message.contains("idle timeout") => true,
         _ => false,
     }
 }
@@ -701,19 +655,7 @@ async fn handle_connect(
             // `max_clients`, so release the dial slot before starting relay I/O.
             drop(dial_permit);
             send_reply(client, SOCKS5_REPLY_SUCCEEDED, bind_addr).await?;
-            tokio::select! {
-                relay_res = copy_bidirectional(client, &mut upstream) => {
-                    let _ = relay_res.map_err(Error::Io)?;
-                    Ok(())
-                }
-                _ = runtime.wait_for_generation_change(session_generation) => {
-                    let _ = upstream.shutdown().await;
-                    let _ = client.shutdown().await;
-                    Err(Error::Session(
-                        "AIVPN tunnel reset during local SOCKS5 relay".into(),
-                    ))
-                }
-            }
+            relay_tcp_until_idle(client, &mut upstream, runtime, session_id, session_generation).await
         }
         Err(connect_err) => {
             let dial_elapsed = dial_started.elapsed();
@@ -801,9 +743,18 @@ async fn handle_udp_associate(
     let mut control_buf = [0u8; 1];
     let mut client_buf = vec![0u8; 65_535];
     let mut upstream_buf = vec![0u8; 65_535];
+    let idle_timer = sleep_until(TokioInstant::now() + LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT);
+    tokio::pin!(idle_timer);
 
     loop {
         tokio::select! {
+            _ = &mut idle_timer => {
+                return Err(Error::Session(format!(
+                    "Local SOCKS5 UDP session #{} idle timeout after {}s",
+                    session_id,
+                    LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT.as_secs()
+                )));
+            }
             _ = runtime.wait_for_generation_change(session_generation) => {
                 return Err(Error::Session(
                     "AIVPN tunnel reset during local SOCKS5 UDP relay".into(),
@@ -812,7 +763,11 @@ async fn handle_udp_associate(
             control_res = client.read(&mut control_buf) => {
                 match control_res {
                     Ok(0) => break,
-                    Ok(_) => {}
+                    Ok(_) => {
+                        idle_timer
+                            .as_mut()
+                            .reset(TokioInstant::now() + LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT);
+                    }
                     Err(err) => return Err(Error::Io(err)),
                 }
             }
@@ -846,6 +801,9 @@ async fn handle_udp_associate(
                     .send_to(payload, upstream_addr)
                     .await
                     .map_err(Error::Io)?;
+                idle_timer
+                    .as_mut()
+                    .reset(TokioInstant::now() + LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT);
             }
             upstream_res = relay_upstream.recv_from(&mut upstream_buf) => {
                 let (len, source_addr) = upstream_res.map_err(Error::Io)?;
@@ -855,12 +813,82 @@ async fn handle_udp_associate(
                         .send_to(&packet, client_addr)
                         .await
                         .map_err(Error::Io)?;
+                    idle_timer
+                        .as_mut()
+                        .reset(TokioInstant::now() + LOCAL_SOCKS5_UDP_ASSOCIATE_IDLE_TIMEOUT);
                 }
             }
         }
     }
 
     Ok(())
+}
+
+async fn relay_tcp_until_idle(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    runtime: Arc<LocalSocks5Runtime>,
+    session_id: u64,
+    session_generation: u64,
+) -> Result<()> {
+    let mut client_buf = vec![0u8; 16 * 1024];
+    let mut upstream_buf = vec![0u8; 16 * 1024];
+    let mut client_closed = false;
+    let mut upstream_closed = false;
+    let idle_timer = sleep_until(TokioInstant::now() + LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT);
+    tokio::pin!(idle_timer);
+
+    loop {
+        tokio::select! {
+            _ = &mut idle_timer => {
+                let _ = upstream.shutdown().await;
+                let _ = client.shutdown().await;
+                return Err(Error::Session(format!(
+                    "Local SOCKS5 session #{} idle timeout after {}s",
+                    session_id,
+                    LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT.as_secs()
+                )));
+            }
+            _ = runtime.wait_for_generation_change(session_generation) => {
+                let _ = upstream.shutdown().await;
+                let _ = client.shutdown().await;
+                return Err(Error::Session(
+                    "AIVPN tunnel reset during local SOCKS5 relay".into(),
+                ));
+            }
+            client_read = client.read(&mut client_buf), if !client_closed => {
+                let read = client_read.map_err(Error::Io)?;
+                if read == 0 {
+                    client_closed = true;
+                    let _ = upstream.shutdown().await;
+                    if upstream_closed {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                upstream.write_all(&client_buf[..read]).await.map_err(Error::Io)?;
+                idle_timer
+                    .as_mut()
+                    .reset(TokioInstant::now() + LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT);
+            }
+            upstream_read = upstream.read(&mut upstream_buf), if !upstream_closed => {
+                let read = upstream_read.map_err(Error::Io)?;
+                if read == 0 {
+                    upstream_closed = true;
+                    let _ = client.shutdown().await;
+                    if client_closed {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                client.write_all(&upstream_buf[..read]).await.map_err(Error::Io)?;
+                idle_timer
+                    .as_mut()
+                    .reset(TokioInstant::now() + LOCAL_SOCKS5_TCP_RELAY_IDLE_TIMEOUT);
+            }
+            else => return Ok(()),
+        }
+    }
 }
 
 fn is_nonblocking_connect_in_progress(err: &io::Error) -> bool {
@@ -1251,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_forces_reconnect_after_ready_network_unreachable_burst() {
+    fn runtime_keeps_running_after_ready_network_unreachable_burst() {
         let runtime = LocalSocks5Runtime::new(1);
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         runtime.set_ready(true);
@@ -1264,9 +1292,7 @@ mod tests {
             );
         }
 
-        let reason = runtime.take_forced_reconnect_reason();
-        assert!(reason.is_some());
-        assert!(!runtime.is_ready());
+        assert!(runtime.is_ready());
     }
 
     #[test]
@@ -1283,11 +1309,11 @@ mod tests {
             );
         }
 
-        assert!(runtime.take_forced_reconnect_reason().is_none());
+        assert!(!runtime.is_ready());
     }
 
     #[test]
-    fn runtime_forces_reconnect_after_ready_timeout_burst() {
+    fn runtime_keeps_running_after_ready_timeout_burst() {
         let runtime = LocalSocks5Runtime::new(1);
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         runtime.set_ready(true);
@@ -1300,8 +1326,6 @@ mod tests {
             );
         }
 
-        let reason = runtime.take_forced_reconnect_reason();
-        assert!(reason.is_some());
-        assert!(!runtime.is_ready());
+        assert!(runtime.is_ready());
     }
 }

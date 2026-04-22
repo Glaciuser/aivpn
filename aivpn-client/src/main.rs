@@ -25,7 +25,6 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
-const IMMEDIATE_LOCAL_SOCKS_RECONNECT_PREFIX: &str = "Local SOCKS5 requested reconnect:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -259,8 +258,8 @@ async fn main() {
             server_signing_pub: None,
         };
 
-        let mut reconnect_delay = backoff;
-        let mut advance_backoff = true;
+        let reconnect_delay = backoff;
+        let advance_backoff = true;
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
@@ -276,23 +275,12 @@ async fn main() {
                     Ok(()) => break,
                     Err(err) => {
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
-                        if is_immediate_local_socks_reconnect(&err) {
-                            reconnect_delay = Duration::ZERO;
-                            advance_backoff = false;
-                            backoff = INITIAL_RECONNECT_BACKOFF;
-                            warn!(
-                                "Client run failed: {}. Reconnect attempt #{} immediately",
-                                err,
-                                reconnect_attempt
-                            );
-                        } else {
-                            warn!(
-                                "Client run failed: {}. Reconnect attempt #{} in {}s",
-                                err,
-                                reconnect_attempt,
-                                backoff.as_secs()
-                            );
-                        }
+                        warn!(
+                            "Client run failed: {}. Reconnect attempt #{} in {}s",
+                            err,
+                            reconnect_attempt,
+                            backoff.as_secs()
+                        );
                     }
                 }
             }
@@ -323,14 +311,6 @@ async fn main() {
     if let Some(task) = local_socks5_task.take() {
         task.abort();
     }
-}
-
-fn is_immediate_local_socks_reconnect(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::Session(message)
-            if message.starts_with(IMMEDIATE_LOCAL_SOCKS_RECONNECT_PREFIX)
-    )
 }
 
 fn resolve_runtime_settings(args: &ClientArgs) -> Result<RuntimeSettings> {
@@ -731,19 +711,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detects_immediate_local_socks_reconnect_errors() {
-        let err = Error::Session(format!(
-            "{IMMEDIATE_LOCAL_SOCKS_RECONNECT_PREFIX} dial timeouts"
-        ));
-
-        assert!(is_immediate_local_socks_reconnect(&err));
-    }
-
-    #[test]
-    fn ignores_regular_session_errors_for_immediate_reconnect() {
-        let err = Error::Session("Server inactivity timeout after 45s".into());
-
-        assert!(!is_immediate_local_socks_reconnect(&err));
-    }
 }
