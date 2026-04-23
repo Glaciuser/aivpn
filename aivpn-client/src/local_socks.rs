@@ -128,6 +128,8 @@ pub struct LocalSocks5Runtime {
     next_session_id: portable_atomic::AtomicU64,
     generation: portable_atomic::AtomicU64,
     reset_notify: Notify,
+    reconnect_generation: portable_atomic::AtomicU64,
+    reconnect_notify: Notify,
     diagnostics: Mutex<LocalSocks5Diagnostics>,
 }
 
@@ -138,6 +140,7 @@ struct LocalSocks5Diagnostics {
     ready_timeout_streak: u32,
     ready_timeout_window_started_at: Option<Instant>,
     last_unavailable_log_at: Option<Instant>,
+    last_reconnect_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -164,6 +167,8 @@ impl LocalSocks5Runtime {
             next_session_id: portable_atomic::AtomicU64::new(1),
             generation: portable_atomic::AtomicU64::new(1),
             reset_notify: Notify::new(),
+            reconnect_generation: portable_atomic::AtomicU64::new(1),
+            reconnect_notify: Notify::new(),
             diagnostics: Mutex::new(LocalSocks5Diagnostics::default()),
         }
     }
@@ -178,6 +183,7 @@ impl LocalSocks5Runtime {
             self.clear_connectivity_failure_streak();
             if let Ok(mut diagnostics) = self.diagnostics.lock() {
                 diagnostics.last_unavailable_log_at = None;
+                diagnostics.last_reconnect_reason = None;
             }
         }
     }
@@ -204,6 +210,10 @@ impl LocalSocks5Runtime {
         self.generation.load(Ordering::SeqCst)
     }
 
+    pub fn current_reconnect_generation(&self) -> u64 {
+        self.reconnect_generation.load(Ordering::SeqCst)
+    }
+
     pub fn available_dial_slots(&self) -> usize {
         self.dial_slots.available_permits()
     }
@@ -215,6 +225,23 @@ impl LocalSocks5Runtime {
     pub fn reset_active_sessions(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.reset_notify.notify_waiters();
+    }
+
+    pub fn last_reconnect_reason(&self) -> Option<String> {
+        self.diagnostics
+            .lock()
+            .ok()
+            .and_then(|diagnostics| diagnostics.last_reconnect_reason.clone())
+    }
+
+    pub fn request_reconnect(&self, reason: String) {
+        self.set_ready(false);
+        self.reset_active_sessions();
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            diagnostics.last_reconnect_reason = Some(reason);
+        }
+        self.reconnect_generation.fetch_add(1, Ordering::SeqCst);
+        self.reconnect_notify.notify_waiters();
     }
 
     pub fn clear_connectivity_failure_streak(&self) {
@@ -236,6 +263,7 @@ impl LocalSocks5Runtime {
         let now = Instant::now();
         let mut streak_to_log = None;
         let mut should_log_unavailable = false;
+        let mut reconnect_reason = None;
 
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             if !ready {
@@ -269,6 +297,16 @@ impl LocalSocks5Runtime {
                 {
                     streak_to_log = Some(streak);
                 }
+                if streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
+                    reconnect_reason = Some(format!(
+                        "Local SOCKS5 saw {} ready-state network unreachable replies within {:?}; latest target {} from {}: {}",
+                        LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD,
+                        LOCAL_SOCKS5_FORCE_RECONNECT_WINDOW,
+                        target_display,
+                        peer_addr,
+                        detail
+                    ));
+                }
             }
         }
 
@@ -284,13 +322,22 @@ impl LocalSocks5Runtime {
 
         if let Some(streak) = streak_to_log {
             warn!(
-                "Local SOCKS5 returned network unreachable for {} from {} while the dataplane was marked ready (streak {}/{}): {}",
+                "Local SOCKS5 returned network unreachable for {} from {} while the dataplane was marked ready (streak {}/{}{}): {}",
                 target_display,
                 peer_addr,
                 streak,
                 LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD,
+                if streak == LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
+                    "; requesting client reconnect"
+                } else {
+                    ""
+                },
                 detail
             );
+        }
+
+        if let Some(reason) = reconnect_reason {
+            self.request_reconnect(reason);
         }
     }
 
@@ -306,6 +353,7 @@ impl LocalSocks5Runtime {
 
         let now = Instant::now();
         let mut streak_to_log = None;
+        let mut reconnect_reason = None;
 
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             let reset_window = match diagnostics.ready_timeout_window_started_at {
@@ -327,17 +375,36 @@ impl LocalSocks5Runtime {
             {
                 streak_to_log = Some(streak);
             }
+            if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+                reconnect_reason = Some(format!(
+                    "Local SOCKS5 saw {} ready-state connect timeouts within {:?}; latest target {} from {}: {}",
+                    LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
+                    LOCAL_SOCKS5_TIMEOUT_RECONNECT_WINDOW,
+                    target_display,
+                    peer_addr,
+                    detail
+                ));
+            }
         }
 
         if let Some(streak) = streak_to_log {
             warn!(
-                "Local SOCKS5 dial to {} from {} timed out while the dataplane was marked ready (streak {}/{}): {}",
+                "Local SOCKS5 dial to {} from {} timed out while the dataplane was marked ready (streak {}/{}{}): {}",
                 target_display,
                 peer_addr,
                 streak,
                 LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD,
+                if streak == LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
+                    "; requesting client reconnect"
+                } else {
+                    ""
+                },
                 detail
             );
+        }
+
+        if let Some(reason) = reconnect_reason {
+            self.request_reconnect(reason);
         }
     }
 
@@ -345,6 +412,16 @@ impl LocalSocks5Runtime {
         loop {
             let notified = self.reset_notify.notified();
             if self.current_generation() != generation {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_reconnect_generation_change(&self, generation: u64) {
+        loop {
+            let notified = self.reconnect_notify.notified();
+            if self.current_reconnect_generation() != generation {
                 return;
             }
             notified.await;
@@ -1279,10 +1356,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_keeps_running_after_ready_network_unreachable_burst() {
+    fn runtime_requests_reconnect_after_ready_network_unreachable_burst() {
         let runtime = LocalSocks5Runtime::new(1);
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         runtime.set_ready(true);
+        let reconnect_generation = runtime.current_reconnect_generation();
 
         for _ in 0..LOCAL_SOCKS5_FORCE_RECONNECT_THRESHOLD {
             runtime.observe_network_unreachable_reply(
@@ -1292,7 +1370,8 @@ mod tests {
             );
         }
 
-        assert!(runtime.is_ready());
+        assert!(!runtime.is_ready());
+        assert!(runtime.current_reconnect_generation() > reconnect_generation);
     }
 
     #[test]
@@ -1313,10 +1392,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_keeps_running_after_ready_timeout_burst() {
+    fn runtime_requests_reconnect_after_ready_timeout_burst() {
         let runtime = LocalSocks5Runtime::new(1);
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         runtime.set_ready(true);
+        let reconnect_generation = runtime.current_reconnect_generation();
 
         for _ in 0..LOCAL_SOCKS5_TIMEOUT_RECONNECT_THRESHOLD {
             runtime.observe_connect_timeout(
@@ -1326,6 +1406,7 @@ mod tests {
             );
         }
 
-        assert!(runtime.is_ready());
+        assert!(!runtime.is_ready());
+        assert!(runtime.current_reconnect_generation() > reconnect_generation);
     }
 }

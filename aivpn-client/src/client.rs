@@ -423,6 +423,11 @@ impl AivpnClient {
             runtime.set_ready(true);
             info!("Local SOCKS5 dataplane is ready");
         }
+        let local_socks_reconnect_generation = self
+            .config
+            .local_socks5_runtime
+            .as_ref()
+            .map(|runtime| runtime.current_reconnect_generation());
 
         // Main loop: download + shutdown + upload health
         let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
@@ -438,6 +443,21 @@ impl AivpnClient {
                         info!("Shutdown requested");
                         stats_task.abort();
                         break Ok(());
+                    }
+
+                    if let (Some(runtime), Some(reconnect_generation)) = (
+                        &self.config.local_socks5_runtime,
+                        local_socks_reconnect_generation,
+                    ) {
+                        if runtime.current_reconnect_generation() != reconnect_generation {
+                            let reconnect_reason = runtime.last_reconnect_reason().unwrap_or_else(|| {
+                                "Local SOCKS5 connectivity failures requested a client reconnect"
+                                    .to_string()
+                            });
+                            warn!("{reconnect_reason}");
+                            stats_task.abort();
+                            break Err(Error::Session(reconnect_reason));
+                        }
                     }
 
                     let inactive_for_ms = crypto::current_timestamp_ms()
